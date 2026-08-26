@@ -12,11 +12,73 @@ from pytest_homeassistant_custom_component.common import (
     async_capture_events,
 )
 
+from custom_components.bticino_intercom import (
+    RUNTIME_RETRY_DELAYS,
+    WS_STABLE_CONNECTION_SECONDS,
+    _next_websocket_retry,
+)
 from custom_components.bticino_intercom.const import DOMAIN
 
 from .conftest import EXTERNAL_UNIT_ID, HOME_ID, _setup_integration
 
 pytestmark = pytest.mark.usefixtures("enable_custom_integrations")
+
+
+def test_short_websocket_sessions_keep_escalating_backoff() -> None:
+    """A successful handshake followed by a quick close is still a failure."""
+    attempt = 0
+
+    for expected_attempt, expected_delay in enumerate(RUNTIME_RETRY_DELAYS, start=1):
+        attempt, delay, stable = _next_websocket_retry(
+            attempt=attempt,
+            is_boot=False,
+            session_duration=WS_STABLE_CONNECTION_SECONDS - 1,
+            received_message=False,
+        )
+
+        assert attempt == expected_attempt
+        assert delay == expected_delay
+        assert stable is False
+
+    assert attempt == 5
+
+
+@pytest.mark.parametrize(
+    ("session_duration", "received_message"),
+    [
+        (WS_STABLE_CONNECTION_SECONDS, False),
+        (1, True),
+    ],
+)
+def test_healthy_websocket_session_resets_backoff(
+    session_duration: float,
+    received_message: bool,
+) -> None:
+    """A stable session or real message re-arms the shortest retry delay."""
+    attempt, delay, stable = _next_websocket_retry(
+        attempt=4,
+        is_boot=False,
+        session_duration=session_duration,
+        received_message=received_message,
+    )
+
+    assert attempt == 1
+    assert delay == RUNTIME_RETRY_DELAYS[0]
+    assert stable is True
+
+
+def test_failed_boot_connection_uses_boot_backoff() -> None:
+    """A connection that never completed keeps the boot retry schedule."""
+    attempt, delay, stable = _next_websocket_retry(
+        attempt=1,
+        is_boot=True,
+        session_duration=None,
+        received_message=False,
+    )
+
+    assert attempt == 2
+    assert delay == 10
+    assert stable is False
 
 
 async def test_setup_entry_success(
