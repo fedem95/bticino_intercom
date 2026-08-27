@@ -82,6 +82,20 @@ def _next_websocket_retry(
     return attempt + 1, base_delay, stable
 
 
+async def _wait_for_websocket_listener(listener_task: asyncio.Task[None], timeout: float) -> bool:
+    """Wait for the listener without creating an orphaned shield future.
+
+    Return ``False`` when the timeout expires. If the listener finishes, await
+    it so its result or exception is consumed exactly once by the manager.
+    """
+    done, _ = await asyncio.wait({listener_task}, timeout=timeout)
+    if listener_task not in done:
+        return False
+
+    await listener_task
+    return True
+
+
 async def _deferred_start_websocket(hass, entry, start_fn):
     """Wait for the config entry to finish loading, then start the WebSocket manager."""
     for _ in range(30):
@@ -296,28 +310,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         # Monitor loop: check stale WS + proactive re-subscribe
                         _LOGGER.debug("Waiting for WebSocket listener task to complete...")
                         last_resubscribe = asyncio.get_running_loop().time()
-                        while not listener_task.done():
-                            try:
-                                await asyncio.wait_for(asyncio.shield(listener_task), timeout=60)
-                            except TimeoutError:
-                                # Proactive re-subscribe to keep session alive
-                                elapsed = asyncio.get_running_loop().time() - last_resubscribe
-                                if elapsed >= TOKEN_RESUBSCRIBE_INTERVAL:
-                                    try:
-                                        _LOGGER.info("Re-subscribing with fresh token (%.0fs elapsed)...", elapsed)
-                                        await websocket_client.resubscribe()
-                                        last_resubscribe = asyncio.get_running_loop().time()
-                                        _LOGGER.info("Re-subscribe successful, connection kept alive.")
-                                    except Exception:
-                                        _LOGGER.warning("Re-subscribe failed, forcing reconnect.", exc_info=True)
-                                        listener_task.cancel()
-                                        with suppress(asyncio.CancelledError):
-                                            await listener_task
-                                        break
-                            except asyncio.CancelledError:
-                                raise
-                        else:
-                            _LOGGER.info("WebSocket listener task finished cleanly.")
+                        while True:
+                            listener_finished = await _wait_for_websocket_listener(listener_task, timeout=60)
+                            if listener_finished:
+                                _LOGGER.info("WebSocket listener task finished cleanly.")
+                                break
+
+                            # Proactive re-subscribe to keep session alive
+                            elapsed = asyncio.get_running_loop().time() - last_resubscribe
+                            if elapsed >= TOKEN_RESUBSCRIBE_INTERVAL:
+                                try:
+                                    _LOGGER.info("Re-subscribing with fresh token (%.0fs elapsed)...", elapsed)
+                                    await websocket_client.resubscribe()
+                                    last_resubscribe = asyncio.get_running_loop().time()
+                                    _LOGGER.info("Re-subscribe successful, connection kept alive.")
+                                except Exception:
+                                    _LOGGER.warning("Re-subscribe failed, forcing reconnect.", exc_info=True)
+                                    listener_task.cancel()
+                                    with suppress(asyncio.CancelledError):
+                                        await listener_task
+                                    break
                     else:
                         _LOGGER.warning("Could not get listener task after connect. Treating as disconnection.")
 

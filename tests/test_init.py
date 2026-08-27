@@ -1,5 +1,6 @@
 """Tests for BTicino integration setup and unload."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +17,7 @@ from custom_components.bticino_intercom import (
     RUNTIME_RETRY_DELAYS,
     WS_STABLE_CONNECTION_SECONDS,
     _next_websocket_retry,
+    _wait_for_websocket_listener,
 )
 from custom_components.bticino_intercom.const import DOMAIN
 
@@ -79,6 +81,25 @@ def test_failed_boot_connection_uses_boot_backoff() -> None:
     assert attempt == 2
     assert delay == 10
     assert stable is False
+
+
+async def test_listener_timeout_then_exception_is_consumed_by_manager() -> None:
+    """A polling timeout must not leave a shield future with an unhandled error."""
+    release_listener = asyncio.Event()
+
+    async def _listener() -> None:
+        await release_listener.wait()
+        raise RuntimeError("listener failed")
+
+    listener_task = asyncio.create_task(_listener())
+
+    assert await _wait_for_websocket_listener(listener_task, timeout=0) is False
+
+    release_listener.set()
+    with pytest.raises(RuntimeError, match="listener failed"):
+        await _wait_for_websocket_listener(listener_task, timeout=1)
+
+    assert listener_task.done()
 
 
 async def test_setup_entry_success(
