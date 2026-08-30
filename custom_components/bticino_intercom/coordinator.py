@@ -34,6 +34,7 @@ from .const import (
     EVENT_TYPE_MISSED_CALL,
     EVENT_TYPE_TERMINATED,
     SIGNAL_CALL_RECEIVED,
+    STATUS_EVENT_DEDUP_WINDOW,
     SUBTYPE_EXTERNAL_UNIT,
     UPDATE_INTERVAL,
 )
@@ -93,6 +94,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         # broadcasts to every device registered for push notifications.
         # See issue #56.
         self._closed_sessions: dict[str, datetime] = {}
+        # Recently processed Format B status events. EOS devices can deliver
+        # the same incoming/accepted push many times for one session.
+        self._processed_status_events: dict[tuple[str, str], datetime] = {}
         # Current active call for WebRTC signaling (offer/answer SDP exchange)
         self._active_call: dict[str, Any] | None = None
         # Populated by __init__.py after entry setup.
@@ -360,7 +364,11 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             return await self._process_status_event(message, extra_params, event_type)
 
         # --- Unknown event ---
-        _LOGGER.debug("Unhandled websocket event (push_type=%s): %s", push_type, message)
+        _LOGGER.debug(
+            "Unhandled websocket event: push_type=%s extra_param_keys=%s",
+            push_type,
+            sorted(extra_params),
+        )
         return False
 
     async def _process_rtc_event(
@@ -540,7 +548,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
         return False
 
-    def _resolve_calling_module(self) -> str | None:
+    def _resolve_calling_module(self, extra_params: dict[str, Any] | None = None) -> str | None:
         """Return the external unit a status push refers to, if it can be known.
 
         Status pushes carry the bridge MAC in ``device_id``, never the module id
@@ -557,14 +565,27 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         The unit is identified through ``get_module_subtype``, not the raw
         ``variant`` field: EasyKit modules report a ``type`` and no variant at
         all, and those are exactly the installations this fallback exists for.
+
+        When the push does name an external unit in ``module_id`` that wins over
+        the fallback, and the fallback only considers units on the bridge that
+        sent the push, so a second bridge's unit can't make it ambiguous.
         """
         if self._active_call and (active_module_id := self._active_call.get("module_id")):
             return active_module_id
 
+        modules = self.data.get("modules", {}) if self.data else {}
+        extra_params = extra_params or {}
+
+        explicit_module_id = extra_params.get("module_id")
+        if explicit_module_id in modules and get_module_subtype(modules[explicit_module_id]) == SUBTYPE_EXTERNAL_UNIT:
+            return explicit_module_id
+
+        bridge_id = extra_params.get("device_id")
         external_units = [
             module_id
-            for module_id, module_data in self.data.get("modules", {}).items()
+            for module_id, module_data in modules.items()
             if get_module_subtype(module_data) == SUBTYPE_EXTERNAL_UNIT
+            and (not bridge_id or module_data.get("bridge") in (None, bridge_id))
         ]
         if len(external_units) == 1:
             _LOGGER.debug(
@@ -589,8 +610,18 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         event_type: str,
     ) -> bool:
         """Process a status event (incoming_call, missed_call, accepted_call)."""
+        if self._is_duplicate_status_event(event_type, extra_params):
+            _LOGGER.debug(
+                "Ignoring retransmitted %s status event for session/event %s",
+                event_type,
+                extra_params.get("session_id") or extra_params.get("event_id"),
+            )
+            return False
+
         device_id = extra_params.get("device_id")
-        device_name = self.data.get("modules", {}).get(device_id, {}).get("name", device_id)
+        calling_module_id = self._resolve_calling_module(extra_params)
+        display_id = calling_module_id or device_id
+        device_name = self.data.get("modules", {}).get(display_id, {}).get("name", display_id)
 
         if event_type == "incoming_call":
             _LOGGER.info("Incoming call status event (with snapshot) for %s", device_name)
@@ -601,16 +632,34 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             now_ts = int(datetime.now(UTC).timestamp())
             # Use the same event_id logic as the RTC offer handler so the
             # incoming_call push updates the record created by the offer.
-            calling_module = self._active_call.get("module_id") if self._active_call else None
-            record_module = calling_module or device_id
+            # Whether an RTC offer preceded this push decides who has already
+            # announced the ring: the offer path dispatches the signal itself,
+            # so re-sending it there would only restart the auto-off timer.
+            announced_by_rtc_offer = self._active_call is not None
+            record_module = calling_module_id or device_id
             event_id = extra_params.get("session_id") or f"{now_ts}-{record_module}"
+
+            # Classe 300 EOS may send only Format B status events, without the
+            # RTC offer that normally supplies the external-unit module ID.
+            # Create the minimal active-call state needed by HA entities.
+            if calling_module_id and not announced_by_rtc_offer:
+                self._active_call = {
+                    "session_id": extra_params.get("session_id"),
+                    "tag_id": extra_params.get("tag_id"),
+                    "correlation_id": extra_params.get("correlation_id"),
+                    "device_id": device_id,
+                    "module_id": calling_module_id,
+                    "sdp": None,
+                    "modules": [],
+                    "status_only": True,
+                }
 
             # Download images to local storage BEFORE firing events,
             # so automations/notifications have images available immediately.
-            if self.history is not None and device_id:
+            if self.history is not None and record_module:
                 await self.history.async_record_call(
                     event_id=event_id,
-                    module_id=device_id,
+                    module_id=record_module,
                     module_name=device_name,
                     snapshot_url=snapshot_url,
                     vignette_url=vignette_url,
@@ -618,7 +667,13 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                 )
 
             last_event = self.data.get(DATA_LAST_EVENT, {})
-            if last_event and last_event.get("type") == EVENT_TYPE_INCOMING_CALL:
+            same_session = bool(
+                last_event
+                and last_event.get("type") == EVENT_TYPE_INCOMING_CALL
+                and extra_params.get("session_id")
+                and last_event.get("session_id") == extra_params.get("session_id")
+            )
+            if same_session:
                 last_event["snapshot_url"] = snapshot_url
                 last_event["vignette_url"] = vignette_url
                 _LOGGER.info("Enriched existing call event with snapshot/vignette from incoming_call push")
@@ -627,7 +682,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                     "type": EVENT_TYPE_INCOMING_CALL,
                     "timestamp": datetime.now(UTC),
                     "time": timestamp,
-                    "module_id": device_id,
+                    "module_id": display_id,
                     "module_name": device_name,
                     "session_id": extra_params.get("session_id"),
                     "event_id": event_id,
@@ -635,11 +690,6 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
                     "vignette_url": vignette_url,
                 }
 
-            # Whether an RTC offer preceded this push decides who has already
-            # announced the ring: the offer path dispatches the signal itself,
-            # so re-sending it there would only restart the auto-off timer.
-            announced_by_rtc_offer = bool(self._active_call)
-            calling_module_id = self._resolve_calling_module()
             if calling_module_id:
                 if not announced_by_rtc_offer:
                     # No offer arrived, so this push is the only notice of the
@@ -655,7 +705,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             self.hass.bus.async_fire(
                 EVENT_LOGBOOK_INCOMING_CALL,
-                {"name": f"Incoming Call ({device_name})", "module_id": device_id},
+                {"name": f"Incoming Call ({device_name})", "module_id": display_id},
             )
 
             return True
@@ -664,17 +714,17 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Missed call for %s", device_name)
 
             # Turn off binary sensor — device_id here is the bridge MAC, not the
-            # external unit module_id, so resolve the unit that rang.
-            calling_module = self._resolve_calling_module()
-            if calling_module:
-                async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module)
+            # external unit module_id, so use the resolved unit that rang.
+            if calling_module_id:
+                async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module_id)
+                self._end_call_session(calling_module_id, reason="missed")
             self._active_call = None
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_MISSED_CALL,
                 "timestamp": datetime.now(UTC),
                 "time": extra_params.get("timestamp"),
-                "module_id": device_id,
+                "module_id": display_id,
                 "module_name": device_name,
                 "session_id": extra_params.get("session_id"),
                 "event_id": extra_params.get("event_id"),
@@ -682,7 +732,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             self.hass.bus.async_fire(
                 EVENT_LOGBOOK_MISSED_CALL,
-                {"name": f"Missed Call ({device_name})", "module_id": device_id},
+                {"name": f"Missed Call ({device_name})", "module_id": display_id},
             )
             await self._close_history_event(extra_params.get("session_id"), EVENT_TYPE_MISSED_CALL)
             return True
@@ -690,14 +740,19 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         if event_type == "accepted_call":
             _LOGGER.info("Call accepted for %s", device_name)
 
-            # Don't clear active_call here — accepted means someone answered,
-            # the WebRTC session may still be active on another device
+            if calling_module_id:
+                async_dispatcher_send(self.hass, SIGNAL_CALL_RECEIVED, False, calling_module_id)
+
+            # Keep a real RTC call available for answer mode, but a synthetic
+            # status-only call has completed once it is accepted.
+            if self._active_call and self._active_call.get("status_only"):
+                self._active_call = None
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_ACCEPTED_CALL,
                 "timestamp": datetime.now(UTC),
                 "time": extra_params.get("timestamp"),
-                "module_id": device_id,
+                "module_id": display_id,
                 "module_name": device_name,
                 "session_id": extra_params.get("session_id"),
                 "event_id": extra_params.get("event_id"),
@@ -705,13 +760,30 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
 
             self.hass.bus.async_fire(
                 EVENT_LOGBOOK_ACCEPTED_CALL,
-                {"name": f"Call Accepted ({device_name})", "module_id": device_id},
+                {"name": f"Call Accepted ({device_name})", "module_id": display_id},
             )
             # Without this the record keeps the "incoming_call" it was created
             # with, and every answered call still reads as missed in the history.
             await self._close_history_event(extra_params.get("session_id"), EVENT_TYPE_ANSWERED_ELSEWHERE)
             return True
 
+        return False
+
+    def _is_duplicate_status_event(self, event_type: str, extra_params: dict[str, Any]) -> bool:
+        """Deduplicate retransmitted Format B status events."""
+        event_key = extra_params.get("session_id") or extra_params.get("event_id") or extra_params.get("subevent_id")
+        if not event_key:
+            return False
+
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=STATUS_EVENT_DEDUP_WINDOW)
+        self._processed_status_events = {
+            key: seen_at for key, seen_at in self._processed_status_events.items() if seen_at > cutoff
+        }
+        key = (event_type, str(event_key))
+        if key in self._processed_status_events:
+            return True
+        self._processed_status_events[key] = now
         return False
 
     def _update_last_event(
@@ -825,7 +897,13 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
     async def _handle_websocket_message(self, message: dict[str, Any]) -> None:
         """Handle incoming WebSocket messages."""
         self._last_ws_message_time = datetime.now(UTC)
-        _LOGGER.debug("Coordinator: _handle_websocket_message called with: %s", message)
+        extra_params = message.get("extra_params", {})
+        _LOGGER.debug(
+            "Coordinator received WebSocket event: push_type=%s event_type=%s rtc_action=%s",
+            message.get("push_type"),
+            extra_params.get("event_type"),
+            extra_params.get("data", {}).get("type"),
+        )
         data_updated = await self._process_websocket_event(message)
 
         # No longer need the complex logic checking event_list or push_type here,

@@ -19,14 +19,27 @@ from homeassistant.util.dt import utc_from_timestamp, utcnow
 
 from .const import (
     DOMAIN,
+    EVENT_TYPE_ACCEPTED_CALL,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
+    EVENT_TYPE_MISSED_CALL,
     EVENT_TYPE_TERMINATED,
 )
 from .coordinator import BticinoIntercomCoordinator
 from .utils import cleanup_orphaned_entities, format_timestamp_iso, format_uptime_readable
 
 _LOGGER = logging.getLogger(__name__)
+
+CALL_EVENT_TYPES = frozenset(
+    {
+        "call",
+        EVENT_TYPE_INCOMING_CALL,
+        EVENT_TYPE_ACCEPTED_CALL,
+        EVENT_TYPE_MISSED_CALL,
+        EVENT_TYPE_ANSWERED_ELSEWHERE,
+        EVENT_TYPE_TERMINATED,
+    }
+)
 
 
 async def async_setup_entry(
@@ -122,8 +135,8 @@ class BticinoEventSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEn
         last_event = self.coordinator.data.get("last_event")
         if not last_event:
             events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
-            if events:
-                last_event = events[0]
+            last_event = next((event for event in events if self._is_call_event(event)), None)
+            if last_event:
                 _LOGGER.debug("EventSensor: Using event from history: %s", last_event)
             else:
                 self._attr_available = False
@@ -175,6 +188,16 @@ class BticinoEventSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEn
             "vignette_expires_at_iso": vignette_expires_at_iso,
         }
         self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
+
+    @staticmethod
+    def _is_call_event(event: dict[str, Any]) -> bool:
+        """Return whether an API history item represents an intercom call."""
+        if event.get("type") in CALL_EVENT_TYPES:
+            return True
+        subevents = event.get("subevents")
+        if not isinstance(subevents, list):
+            return False
+        return any(isinstance(subevent, dict) and subevent.get("type") in CALL_EVENT_TYPES for subevent in subevents)
 
     @property
     def icon(self) -> str | None:
