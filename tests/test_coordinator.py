@@ -16,6 +16,7 @@ from custom_components.bticino_intercom.const import (
     CALL_RETRANSMIT_WINDOW,
     CALL_SESSION_MAX_DURATION,
     DATA_LAST_EVENT,
+    EVENT_CALL,
     EVENT_TYPE_ACCEPTED_CALL,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
@@ -28,7 +29,7 @@ from custom_components.bticino_intercom.coordinator import (
     BticinoIntercomCoordinator,
 )
 
-from .conftest import BRIDGE_MAC, EXTERNAL_UNIT_ID, SESSION_ID
+from .conftest import BRIDGE_MAC, EXTERNAL_UNIT_2_ID, EXTERNAL_UNIT_ID, SESSION_ID
 
 # =============================================================================
 # Format A: RTC events
@@ -282,6 +283,37 @@ class TestStatusIncomingCall:
         # active_call should still be set from the offer
         assert coordinator.active_call is not None
 
+    async def test_status_only_call_resolves_sole_external_unit_and_rings(
+        self,
+        hass: HomeAssistant,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+    ) -> None:
+        """EOS status-only calls should ring both HA call entities."""
+        coordinator.data["modules"].pop(EXTERNAL_UNIT_2_ID)
+        coordinator.history = AsyncMock()
+        signals = []
+        call_events = async_capture_events(hass, EVENT_CALL)
+
+        with patch(
+            "custom_components.bticino_intercom.coordinator.async_dispatcher_send",
+            side_effect=lambda *args: signals.append(args),
+        ):
+            result = await coordinator._process_websocket_event(ws_incoming_call)
+        await hass.async_block_till_done()
+
+        assert result is True
+        assert signals == [(hass, SIGNAL_CALL_RECEIVED, True, EXTERNAL_UNIT_ID)]
+        assert coordinator.active_call is not None
+        assert coordinator.active_call["module_id"] == EXTERNAL_UNIT_ID
+        assert coordinator.active_call["status_only"] is True
+        assert coordinator.data[DATA_LAST_EVENT]["module_id"] == EXTERNAL_UNIT_ID
+        assert len(call_events) == 1
+        assert call_events[0].data["type"] == "ring"
+        assert call_events[0].data["module_id"] == EXTERNAL_UNIT_ID
+        coordinator.history.async_record_call.assert_awaited_once()
+        assert coordinator.history.async_record_call.call_args.kwargs["module_id"] == EXTERNAL_UNIT_ID
+
 
 class TestStatusMissedCall:
     """Test BNC1-missed_call status event processing."""
@@ -380,6 +412,55 @@ class TestStatusAcceptedCall:
 
         last = coordinator.data[DATA_LAST_EVENT]
         assert last["type"] == EVENT_TYPE_ACCEPTED_CALL
+
+    async def test_accepted_call_ends_status_only_ring(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+        ws_accepted_call: dict,
+    ) -> None:
+        """An accepted EOS status call should turn off the call sensor."""
+        coordinator.data["modules"].pop(EXTERNAL_UNIT_2_ID)
+        await coordinator._process_websocket_event(ws_incoming_call)
+        signals = []
+
+        with patch(
+            "custom_components.bticino_intercom.coordinator.async_dispatcher_send",
+            side_effect=lambda *args: signals.append(args),
+        ):
+            result = await coordinator._process_websocket_event(ws_accepted_call)
+
+        assert result is True
+        assert signals == [(coordinator.hass, SIGNAL_CALL_RECEIVED, False, EXTERNAL_UNIT_ID)]
+        assert coordinator.active_call is None
+
+
+class TestStatusEventDedup:
+    """EOS retransmits identical Format B status pushes."""
+
+    async def test_duplicate_incoming_calls_trigger_one_refresh(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+    ) -> None:
+        """Twelve copies of one incoming call should be processed once."""
+        with patch.object(coordinator, "async_request_refresh", new=AsyncMock()) as mock_refresh:
+            for _ in range(12):
+                await coordinator._handle_websocket_message(ws_incoming_call)
+
+        assert mock_refresh.await_count == 1
+
+    async def test_incoming_and_accepted_same_session_are_distinct(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_incoming_call: dict,
+        ws_accepted_call: dict,
+    ) -> None:
+        """Deduplication must not discard a different state for the call."""
+        ws_accepted_call["extra_params"]["session_id"] = SESSION_ID
+
+        assert await coordinator._process_websocket_event(ws_incoming_call) is True
+        assert await coordinator._process_websocket_event(ws_accepted_call) is True
 
 
 # =============================================================================

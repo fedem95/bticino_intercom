@@ -84,6 +84,8 @@ CALL_SESSION_MAX_DURATION = 180
 # so duplicate terminate/rescind RTC events (Netatmo push retransmits
 # to multiple receivers) don't trigger redundant API refreshes. Fixes #56.
 CLOSED_SESSION_DEDUP_WINDOW = 60  # seconds
+# Status pushes may be retransmitted many times for the same call/session.
+STATUS_EVENT_DEDUP_WINDOW = 60  # seconds
 
 # --- Event history ---
 HISTORY_STORAGE_VERSION = 1
