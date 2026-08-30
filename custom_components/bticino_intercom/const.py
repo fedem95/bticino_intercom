@@ -62,6 +62,9 @@ DATA_LAST_EVENT = "last_event"
 # Coordinator update interval (in minutes)
 UPDATE_INTERVAL = 5
 
+# Ignore small boot-time shifts caused by rounded/stale bridge uptime values.
+BRIDGE_BOOT_TIME_DRIFT_TOLERANCE = 300  # seconds
+
 # Light specific constants
 LIGHT_AUTO_OFF_DELAY = 10  # seconds
 

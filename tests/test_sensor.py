@@ -6,7 +6,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.bticino_intercom.const import DATA_LAST_EVENT, DOMAIN
 
-from .conftest import EXT_UNIT_MODULE_ID
+from .conftest import BRIDGE_MAC, EXT_UNIT_MODULE_ID
 
 
 def _get_coordinator(hass: HomeAssistant, entry: MockConfigEntry):
@@ -148,6 +148,55 @@ async def test_bridge_uptime_sensor(
     # Now a timestamp sensor showing boot time, should be a valid ISO date
     assert state.state != "unknown"
     assert state.state != "unavailable"
+
+
+async def test_bridge_last_boot_ignores_small_uptime_jitter(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Rounded EOS uptime values must not create fake reboot history."""
+    coordinator = _get_coordinator(hass, mock_setup_entry)
+    boot_entity = next(
+        entity_id
+        for entity_id in hass.states.async_entity_ids(SENSOR_DOMAIN)
+        if "last_boot" in entity_id or "uptime" in entity_id
+    )
+    before = hass.states.get(boot_entity)
+    assert before is not None
+
+    # Captured EOS data moved the derived boot time by about 214 seconds.
+    coordinator.data["modules"][BRIDGE_MAC]["uptime"] -= 214
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    after = hass.states.get(boot_entity)
+    assert after is not None
+    assert after.state == before.state
+    assert after.last_changed == before.last_changed
+    assert "uptime_readable" not in after.attributes
+
+
+async def test_bridge_last_boot_updates_after_real_uptime_reset(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """A substantial uptime reset should still report a real bridge reboot."""
+    coordinator = _get_coordinator(hass, mock_setup_entry)
+    boot_entity = next(
+        entity_id
+        for entity_id in hass.states.async_entity_ids(SENSOR_DOMAIN)
+        if "last_boot" in entity_id or "uptime" in entity_id
+    )
+    before = hass.states.get(boot_entity)
+    assert before is not None
+
+    coordinator.data["modules"][BRIDGE_MAC]["uptime"] = 10
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    after = hass.states.get(boot_entity)
+    assert after is not None
+    assert after.state != before.state
 
 
 async def test_bridge_wifi_strength_sensor(

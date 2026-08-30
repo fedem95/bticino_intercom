@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.dt import utc_from_timestamp, utcnow
 
 from .const import (
+    BRIDGE_BOOT_TIME_DRIFT_TOLERANCE,
     DOMAIN,
     EVENT_TYPE_ACCEPTED_CALL,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
@@ -26,7 +27,7 @@ from .const import (
     EVENT_TYPE_TERMINATED,
 )
 from .coordinator import BticinoIntercomCoordinator
-from .utils import cleanup_orphaned_entities, format_timestamp_iso, format_uptime_readable
+from .utils import cleanup_orphaned_entities, format_timestamp_iso
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -526,18 +527,43 @@ class BticinoBridgeUptimeSensor(BticinoBridgeBaseSensor):
         """Initialize the uptime sensor."""
         self._attr_unique_id = f"{coordinator.entry.entry_id}_{bridge_id}_uptime"
         self._attr_name = "Bridge Last Boot"
+        self._boot_time = None
+        self._last_uptime_seconds: int | None = None
         super().__init__(coordinator, bridge_id, bridge_module_data)
 
     def _update_state_from_data(self, data: dict[str, Any]) -> None:
-        """Update state — convert uptime seconds to a boot timestamp."""
+        """Update boot timestamp while ignoring normal uptime jitter."""
         uptime_sec = data.get("uptime")
-        if isinstance(uptime_sec, int) and uptime_sec > 0:
-            boot_time = utcnow() - timedelta(seconds=uptime_sec)
-            self._attr_native_value = boot_time
-        else:
-            self._attr_native_value = None
-        attrs = {"uptime_readable": format_uptime_readable(uptime_sec)}
-        self._attr_extra_state_attributes = {k: v for k, v in attrs.items() if v is not None}
+        if not isinstance(uptime_sec, int) or uptime_sec <= 0:
+            # A partial status response must not erase a previously known boot.
+            self._attr_native_value = self._boot_time
+            return
+
+        candidate_boot_time = utcnow() - timedelta(seconds=uptime_sec)
+        if self._boot_time is None:
+            self._boot_time = candidate_boot_time
+        elif self._last_uptime_seconds is not None:
+            uptime_reset = uptime_sec + BRIDGE_BOOT_TIME_DRIFT_TOLERANCE < self._last_uptime_seconds
+            boot_shift = (candidate_boot_time - self._boot_time).total_seconds()
+            if uptime_reset and boot_shift > BRIDGE_BOOT_TIME_DRIFT_TOLERANCE:
+                _LOGGER.info(
+                    "Bridge reboot detected: uptime reset from %ss to %ss",
+                    self._last_uptime_seconds,
+                    uptime_sec,
+                )
+                self._boot_time = candidate_boot_time
+            elif abs(boot_shift) > BRIDGE_BOOT_TIME_DRIFT_TOLERANCE:
+                _LOGGER.debug(
+                    "Ignoring inconsistent bridge uptime shift of %.0fs",
+                    boot_shift,
+                )
+
+        self._last_uptime_seconds = uptime_sec
+        self._attr_native_value = self._boot_time
+        # A changing human-readable uptime attribute caused recorder churn even
+        # when the bridge hadn't rebooted. The timestamp is the sensor's source
+        # of truth, so keep its attributes stable.
+        self._attr_extra_state_attributes = {}
 
 
 class BticinoBridgeWifiStrengthSensor(BticinoBridgeBaseSensor):
