@@ -4,7 +4,7 @@ from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.bticino_intercom.const import DOMAIN
+from custom_components.bticino_intercom.const import DATA_LAST_EVENT, DOMAIN
 
 from .conftest import EXT_UNIT_MODULE_ID
 
@@ -88,6 +88,34 @@ async def test_event_sensor_updates_on_websocket(
     state = hass.states.get(event_entity)
     # After processing an "incoming_call" event, the sensor state should reflect it
     assert state.state == "incoming_call"
+
+
+async def test_event_sensor_ignores_unrelated_history_event(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """After a restart, fall back to the latest call rather than a generic event."""
+    coordinator = _get_coordinator(hass, mock_setup_entry)
+    call_history = coordinator.data["events_history"][coordinator.home_id]
+    coordinator.data[DATA_LAST_EVENT] = {}
+    coordinator.data["events_history"][coordinator.home_id] = [
+        {
+            "id": "generic-event",
+            "type": "new_alarm_status",
+            "time": 1700000300,
+            "message": "Unrelated generic history entry",
+        },
+        *call_history,
+    ]
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    event_entity = next(
+        entity_id for entity_id in hass.states.async_entity_ids(SENSOR_DOMAIN) if "last_event_type" in entity_id
+    )
+    state = hass.states.get(event_entity)
+    assert state is not None
+    assert state.state == "missed_call"
 
 
 async def test_last_call_timestamp_sensor(
