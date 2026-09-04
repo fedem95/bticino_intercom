@@ -259,7 +259,16 @@ class BticinoBridgeBusySensor(CoordinatorEntity[BticinoIntercomCoordinator], Bin
         super().__init__(coordinator)
         self._attr_unique_id = f"{coordinator.entry.entry_id}_bridge_busy"
         self._attr_name = "Bridge Busy"
-        self._attr_is_on = self._get_busy_state()
+        self._update_state()
+
+    @property
+    def available(self) -> bool:
+        """Return whether the bridge exposes a usable busy state."""
+        if not super().available:
+            return False
+
+        bridge_data = self.coordinator.data.get("modules", {}).get(self.coordinator.main_device_id, {})
+        return bridge_data.get("busy") is not None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -276,15 +285,18 @@ class BticinoBridgeBusySensor(CoordinatorEntity[BticinoIntercomCoordinator], Bin
             model=model,
         )
 
-    def _get_busy_state(self) -> bool:
-        """Get the busy state from coordinator data."""
+    def _update_state(self) -> None:
+        """Update the busy state when the bridge exposes it."""
         if not self.coordinator.data:
-            return False
+            self._attr_is_on = None
+            return
+
         bridge_data = self.coordinator.data.get("modules", {}).get(self.coordinator.main_device_id, {})
-        return bool(bridge_data.get("busy", False))
+        busy = bridge_data.get("busy")
+        self._attr_is_on = bool(busy) if busy is not None else None
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        self._attr_is_on = self._get_busy_state()
-        self.async_write_ha_state()
+        self._update_state()
+        super()._handle_coordinator_update()

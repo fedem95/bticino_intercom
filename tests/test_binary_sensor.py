@@ -3,7 +3,7 @@
 from datetime import timedelta
 
 from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
-from homeassistant.const import STATE_OFF, STATE_ON
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from pytest_homeassistant_custom_component.common import (
@@ -141,3 +141,50 @@ async def test_binary_sensor_coordinator_update(
     state = hass.states.get(entity_id)
     # When reachable is False, entity becomes unavailable
     assert state.state == "unavailable"
+
+
+async def test_bridge_busy_unavailable_when_status_is_not_exposed(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Test bridge busy is unavailable when the API omits the busy field."""
+    entity_id = next(
+        entity_id
+        for entity_id in hass.states.async_entity_ids(BINARY_SENSOR_DOMAIN)
+        if "bridge_busy" in entity_id
+    )
+
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+
+async def test_bridge_busy_tracks_status_when_exposed(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Test bridge busy tracks explicit false and true API states."""
+    coordinator = hass.data[DOMAIN][mock_setup_entry.entry_id]["coordinator"]
+    entity_id = next(
+        entity_id
+        for entity_id in hass.states.async_entity_ids(BINARY_SENSOR_DOMAIN)
+        if "bridge_busy" in entity_id
+    )
+
+    new_data = dict(coordinator.data)
+    new_data["modules"] = dict(new_data["modules"])
+    bridge_data = dict(new_data["modules"][coordinator.main_device_id])
+    new_data["modules"][coordinator.main_device_id] = bridge_data
+
+    bridge_data["busy"] = False
+    coordinator.async_set_updated_data(new_data)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_OFF
+
+    bridge_data["busy"] = True
+    coordinator.async_set_updated_data(new_data)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_ON
+
+    bridge_data.pop("busy")
+    coordinator.async_set_updated_data(new_data)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
