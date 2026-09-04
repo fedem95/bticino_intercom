@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from aiohttp import web
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.camera.webrtc import (
     WebRTCAnswer,
@@ -244,6 +245,21 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
             return self._cached_image
 
         return await self._read_from_history()
+
+    async def handle_async_mjpeg_stream(self, request: web.Request) -> web.StreamResponse | None:
+        """Serve the static event image without wrapping it in an endless MJPEG stream.
+
+        Home Assistant's frontend requests ``camera_proxy_stream`` even for a
+        camera without streaming features. The default Camera implementation
+        turns a still image into a multipart stream that never finishes, which
+        Safari may leave undecoded. A regular image response is valid for the
+        frontend's ``img`` element and accurately represents this entity.
+        """
+        del request
+        image = await self.async_camera_image()
+        if image is None:
+            return None
+        return web.Response(body=image, content_type=self.content_type)
 
     async def _read_from_history(self) -> bytes | None:
         """Read the latest image from the local history store."""

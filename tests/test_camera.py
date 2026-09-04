@@ -164,6 +164,32 @@ async def test_png_history_image_bypasses_home_assistant_jpeg_resizer(
     resize_jpeg.assert_not_called()
 
 
+async def test_snapshot_stream_endpoint_returns_a_finite_image_response(
+    hass: HomeAssistant,
+    coordinator: BticinoIntercomCoordinator,
+    tmp_path: Path,
+) -> None:
+    """The static snapshot must not be wrapped in an endless multipart stream."""
+    image = b"\xff\xd8\xff\xee\x00\x0eAdobe\x00\x64\x00\x00\x00\x00\x01jpeg"
+    path = tmp_path / "event_snapshot.jpg"
+    path.write_bytes(image)
+
+    store = MagicMock()
+    store.list_events.return_value = [{"event_id": "event-1"}]
+    store.resolve_image_path.return_value = path
+    hass.data.setdefault(DOMAIN, {})[coordinator.entry.entry_id] = {"history": store}
+
+    camera = BticinoSnapshotCamera(coordinator)
+    camera.hass = hass
+
+    response = await camera.handle_async_mjpeg_stream(MagicMock())
+
+    assert response is not None
+    assert response.status == 200
+    assert response.content_type == "image/jpeg"
+    assert response.body == image
+
+
 class TestEnableAudioSendrecv:
     """Test audio direction fix in SDP."""
 
