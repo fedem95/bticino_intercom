@@ -2,6 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from homeassistant.components.camera import _async_get_image
+from homeassistant.core import HomeAssistant
+
+from custom_components.bticino_intercom.camera import BticinoSnapshotCamera
+from custom_components.bticino_intercom.const import DOMAIN
+from custom_components.bticino_intercom.coordinator import BticinoIntercomCoordinator
+
 
 class TestExtractImageFromEvent:
     """Test _extract_image_from_event for both WS and API event formats."""
@@ -126,6 +136,32 @@ class TestExtractImageFromEvent:
         url, _expires, _time = cam._extract_image_from_event(event)
 
         assert url == "https://example.com/direct.jpg"
+
+
+async def test_png_history_image_bypasses_home_assistant_jpeg_resizer(
+    hass: HomeAssistant,
+    coordinator: BticinoIntercomCoordinator,
+    tmp_path: Path,
+) -> None:
+    """A PNG placeholder must not be advertised or resized as JPEG."""
+    image = b"\x89PNG\r\n\x1a\nplaceholder"
+    path = tmp_path / "event_snapshot.png"
+    path.write_bytes(image)
+
+    store = MagicMock()
+    store.list_events.return_value = [{"event_id": "event-1"}]
+    store.resolve_image_path.return_value = path
+    hass.data.setdefault(DOMAIN, {})[coordinator.entry.entry_id] = {"history": store}
+
+    camera = BticinoSnapshotCamera(coordinator)
+    camera.hass = hass
+
+    with patch("homeassistant.components.camera.scale_jpeg_camera_image") as resize_jpeg:
+        result = await _async_get_image(camera, width=640, height=480)
+
+    assert result.content == image
+    assert result.content_type == "image/png"
+    resize_jpeg.assert_not_called()
 
 
 class TestEnableAudioSendrecv:

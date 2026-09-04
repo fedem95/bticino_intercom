@@ -32,6 +32,23 @@ _LOGGER = logging.getLogger(__name__)
 # Prevents re-downloading the same image repeatedly between coordinator updates
 
 
+def _image_content_type(data: bytes) -> str:
+    """Return the browser content type for common image formats.
+
+    Event images are stored using a ``.jpg`` suffix for compatibility, while
+    voice-only placeholders are PNG files. Home Assistant uses this value to
+    decide whether it may run its JPEG resizer, so it must describe the bytes
+    rather than the filename.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -248,6 +265,13 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
 
         try:
             data = await self.hass.async_add_executor_job(path.read_bytes)
+            self.content_type = _image_content_type(data)
+            _LOGGER.debug(
+                "Loaded %s event image from local history (%d bytes, %s)",
+                self._image_type,
+                len(data),
+                self.content_type,
+            )
             self._cached_image = data
             self._cached_image_time = utcnow()
             return data
@@ -356,6 +380,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 if path is not None:
                     try:
                         data = await self.hass.async_add_executor_job(path.read_bytes)
+                        self.content_type = _image_content_type(data)
                         self._poster_event_id = eid
                         self._poster_bytes = data
                         return data
@@ -796,6 +821,7 @@ class BticinoCallHomeCamera(BticinoWebRTCCamera):
             module_name="Call Home",
         )
         self._attr_unique_id = f"{coordinator.entry.entry_id}_call_home"
+        self.content_type = "image/png"
         self._poster: bytes | None = None
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
