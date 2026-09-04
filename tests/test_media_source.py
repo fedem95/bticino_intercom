@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
+from homeassistant.components.http.auth import async_sign_path
 from homeassistant.components.media_source.error import Unresolvable
 from homeassistant.components.media_source.models import MediaSourceItem
 from homeassistant.core import HomeAssistant
@@ -74,29 +76,35 @@ async def test_browse_entry_lists_modules(hass: HomeAssistant, seeded_store) -> 
 
 async def test_browse_module_lists_events(hass: HomeAssistant, seeded_store) -> None:
     """Browsing a module should list its events."""
+    await async_setup_component(hass, "http", {})
     ms = BticinoMediaSource(hass)
     node = await ms.async_browse_media(MediaSourceItem(hass, DOMAIN, "entry_main/mod_a", None))
     assert node.children is not None
     assert [c.identifier for c in node.children] == ["entry_main/mod_a/evt1"]
+    assert node.children[0].thumbnail is not None
+    assert "authSig=" in node.children[0].thumbnail
 
 
 async def test_browse_event_lists_images(hass: HomeAssistant, seeded_store) -> None:
     """Browsing an event should list snapshot and vignette leaves."""
+    await async_setup_component(hass, "http", {})
     ms = BticinoMediaSource(hass)
     node = await ms.async_browse_media(MediaSourceItem(hass, DOMAIN, "entry_main/mod_a/evt1", None))
     assert node.children is not None
     kinds = sorted(c.identifier.rsplit("/", 1)[-1] for c in node.children)
     assert kinds == ["snapshot", "vignette"]
+    assert all(child.thumbnail is not None and "authSig=" in child.thumbnail for child in node.children)
 
 
 async def test_resolve_returns_play_media(hass: HomeAssistant, seeded_store) -> None:
     """Resolving a leaf identifier must return a playable image path."""
+    await async_setup_component(hass, "http", {})
     ms = BticinoMediaSource(hass)
     play = await ms.async_resolve_media(
         MediaSourceItem(hass, DOMAIN, "entry_main/mod_a/evt1/snapshot", None),
     )
     assert play.mime_type == "image/jpeg"
-    assert play.url == "/api/bticino_intercom/image/entry_main/evt1/snapshot"
+    assert play.url.startswith("/api/bticino_intercom/image/entry_main/evt1/snapshot?authSig=")
     assert play.path is not None and play.path.exists()
 
 
@@ -133,6 +141,103 @@ async def test_image_view_serves_file(
     assert resp.status == 200
     body = await resp.read()
     assert body == b"snap"
+
+
+async def test_image_view_serves_signed_url_without_bearer_token(
+    hass: HomeAssistant,
+    seeded_store,
+    hass_client_no_auth,
+) -> None:
+    """A signed image URL should work in a plain browser image request."""
+    await async_setup_component(hass, "http", {})
+    hass.http.register_view(BticinoHistoryImageView())
+    client = await hass_client_no_auth()
+    media_source = BticinoMediaSource(hass)
+    play = await media_source.async_resolve_media(
+        MediaSourceItem(hass, DOMAIN, "entry_main/mod_a/evt1/snapshot", None),
+    )
+
+    resp = await client.get(play.url)
+
+    assert resp.status == 200
+    assert await resp.read() == b"snap"
+
+
+async def test_image_view_serves_signed_thumbnail_without_bearer_token(
+    hass: HomeAssistant,
+    seeded_store,
+    hass_client_no_auth,
+) -> None:
+    """A browse thumbnail should work as a plain browser image request."""
+    await async_setup_component(hass, "http", {})
+    hass.http.register_view(BticinoHistoryImageView())
+    client = await hass_client_no_auth()
+    media_source = BticinoMediaSource(hass)
+    node = await media_source.async_browse_media(
+        MediaSourceItem(hass, DOMAIN, "entry_main/mod_a", None),
+    )
+    assert node.children is not None
+    thumbnail = node.children[0].thumbnail
+    assert thumbnail is not None
+
+    resp = await client.get(thumbnail)
+
+    assert resp.status == 200
+    assert await resp.read() == b"vig"
+
+
+async def test_image_view_rejects_unsigned_url(
+    hass: HomeAssistant,
+    seeded_store,
+    hass_client_no_auth,
+) -> None:
+    """The history endpoint must remain protected without a signature."""
+    await async_setup_component(hass, "http", {})
+    hass.http.register_view(BticinoHistoryImageView())
+    client = await hass_client_no_auth()
+    url = BticinoHistoryImageView.build_url("entry_main", "evt1", "snapshot")
+
+    resp = await client.get(url)
+
+    assert resp.status == 401
+
+
+async def test_image_view_rejects_invalid_signature(
+    hass: HomeAssistant,
+    seeded_store,
+    hass_client_no_auth,
+) -> None:
+    """A forged signature must not grant access to history images."""
+    await async_setup_component(hass, "http", {})
+    hass.http.register_view(BticinoHistoryImageView())
+    client = await hass_client_no_auth()
+    url = BticinoHistoryImageView.build_url("entry_main", "evt1", "snapshot")
+
+    resp = await client.get(f"{url}?authSig=invalid")
+
+    assert resp.status == 401
+
+
+async def test_image_view_rejects_expired_signature(
+    hass: HomeAssistant,
+    seeded_store,
+    hass_client_no_auth,
+) -> None:
+    """An expired signed URL must no longer grant access."""
+    await async_setup_component(hass, "http", {})
+    hass.http.register_view(BticinoHistoryImageView())
+    client = await hass_client_no_auth()
+    raw_url = BticinoHistoryImageView.build_url("entry_main", "evt1", "snapshot")
+    expired_url = async_sign_path(
+        hass,
+        raw_url,
+        timedelta(seconds=-60),
+        use_content_user=True,
+    )
+
+    resp = await client.get(expired_url)
+
+    assert resp.status == 401
 
 
 async def test_image_view_returns_404_for_missing_event(

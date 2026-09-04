@@ -18,7 +18,11 @@ from urllib.parse import quote
 
 from aiohttp import web
 from homeassistant.components.http import HomeAssistantView
-from homeassistant.components.media_player import MediaClass, MediaType
+from homeassistant.components.media_player import (
+    MediaClass,
+    MediaType,
+    async_process_play_media_url,
+)
 from homeassistant.components.media_source.error import Unresolvable
 from homeassistant.components.media_source.models import (
     BrowseMediaSource,
@@ -82,6 +86,20 @@ class BticinoMediaSource(MediaSource):
         super().__init__(DOMAIN)
         self.hass = hass
 
+    @callback
+    def _signed_image_url(self, entry_id: str, event_id: str, kind: str) -> str:
+        """Return a temporary authenticated URL for a history image.
+
+        Home Assistant signs playable media in its resolve WebSocket handler,
+        but browse thumbnails bypass that handler and are loaded directly by
+        the browser. Sign every image URL here so both paths behave the same.
+        """
+        return async_process_play_media_url(
+            self.hass,
+            BticinoHistoryImageView.build_url(entry_id, event_id, kind),
+            allow_relative_url=True,
+        )
+
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
         """Resolve a media item identifier to a playable URL."""
         parts = (item.identifier or "").split("/")
@@ -98,7 +116,7 @@ class BticinoMediaSource(MediaSource):
         if path is None or not path.is_file():
             raise Unresolvable(f"Image not found: {item.identifier!r}")
 
-        url = BticinoHistoryImageView.build_url(entry_id, event_id, kind)
+        url = self._signed_image_url(entry_id, event_id, kind)
         return PlayMedia(url=url, mime_type=MIME_TYPE, path=path)
 
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
@@ -207,7 +225,7 @@ class BticinoMediaSource(MediaSource):
                 title=_event_title(event),
                 can_play=False,
                 can_expand=True,
-                thumbnail=BticinoHistoryImageView.build_url(entry_id, event["event_id"], "vignette")
+                thumbnail=self._signed_image_url(entry_id, event["event_id"], "vignette")
                 if event.get("vignette_file")
                 else None,
                 children_media_class=MediaClass.IMAGE,
@@ -240,7 +258,7 @@ class BticinoMediaSource(MediaSource):
         for kind in IMAGE_KINDS:
             if not event.get(f"{kind}_file"):
                 continue
-            url = BticinoHistoryImageView.build_url(entry_id, event_id, kind)
+            url = self._signed_image_url(entry_id, event_id, kind)
             children.append(
                 BrowseMediaSource(
                     domain=DOMAIN,
