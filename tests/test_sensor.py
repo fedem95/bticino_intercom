@@ -1,5 +1,7 @@
 """Tests for the BTicino sensor platform."""
 
+from unittest.mock import MagicMock
+
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -260,3 +262,98 @@ async def test_sensor_unavailable_on_coordinator_failure(
     if uptime_entity:
         state = hass.states.get(uptime_entity[0])
         assert state.state == "unavailable"
+
+
+async def test_signed_image_urls_are_not_recorded(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Re-signed image URLs change every poll, so the recorder must skip them."""
+    for unique_suffix in ("_last_event_type", "_last_call_timestamp"):
+        entity = next(
+            entity
+            for entity in hass.data["entity_components"][SENSOR_DOMAIN].entities
+            if entity.unique_id == f"{mock_setup_entry.entry_id}{unique_suffix}"
+        )
+        assert {
+            "snapshot_url",
+            "snapshot_expires_at_iso",
+            "vignette_url",
+            "vignette_expires_at_iso",
+        } <= entity._unrecorded_attributes
+
+
+def _set_local_calls(hass: HomeAssistant, entry: MockConfigEntry, records: list[dict]) -> None:
+    """Swap the coordinator's history store for one holding ``records``."""
+    coordinator = _get_coordinator(hass, entry)
+    coordinator.history = MagicMock()
+    coordinator.history.list_events.return_value = records
+    coordinator.async_update_listeners()
+
+
+LOCAL_CALLS = [
+    {
+        "event_id": "sess-answered",
+        "module_id": EXT_UNIT_MODULE_ID,
+        "event_type": "answered_elsewhere",
+        "timestamp": 1800000000,
+        "ended_at": 1800000012,
+        "answered": True,
+    },
+    {
+        "event_id": "sess-missed",
+        "module_id": EXT_UNIT_MODULE_ID,
+        "event_type": "missed_call",
+        "timestamp": 1799990000,
+        "ended_at": 1799990027,
+        "answered": False,
+    },
+]
+
+
+async def test_call_count_uses_local_history(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """Calls kept locally are counted even when the cloud list has none."""
+    _get_coordinator(hass, mock_setup_entry).data["events_history"] = {}
+    _set_local_calls(hass, mock_setup_entry, LOCAL_CALLS)
+    await hass.async_block_till_done()
+
+    entity_id = next(s for s in hass.states.async_entity_ids(SENSOR_DOMAIN) if s.endswith("_calls"))
+    state = hass.states.get(entity_id)
+    assert state.state == "2"
+    assert state.attributes["answered"] == 1
+    assert state.attributes["missed"] == 1
+
+
+async def test_last_call_timestamp_prefers_newer_local_call(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """A local call newer than anything in the cloud list wins."""
+    _set_local_calls(hass, mock_setup_entry, LOCAL_CALLS)
+    await hass.async_block_till_done()
+
+    entity_id = next(s for s in hass.states.async_entity_ids(SENSOR_DOMAIN) if "last_call_timestamp" in s)
+    state = hass.states.get(entity_id)
+    assert state.state == "2027-01-15T08:00:12+00:00"
+    assert state.attributes["call_event_id"] == "sess-answered"
+    assert state.attributes["call_module_id"] == EXT_UNIT_MODULE_ID
+    assert state.attributes["subevent_type"] == "answered_elsewhere"
+
+
+async def test_last_call_timestamp_keeps_newer_cloud_call(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """An older local call doesn't hide a newer one from the cloud list."""
+    _set_local_calls(
+        hass,
+        mock_setup_entry,
+        [{"event_id": "old", "event_type": "missed_call", "timestamp": 1600000000, "ended_at": 1600000010}],
+    )
+    await hass.async_block_till_done()
+
+    entity_id = next(s for s in hass.states.async_entity_ids(SENSOR_DOMAIN) if "last_call_timestamp" in s)
+    assert hass.states.get(entity_id).attributes["call_event_id"] == "evt_1"

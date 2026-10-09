@@ -811,6 +811,34 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             "subevents": subevents_data,
         }
 
+    def restore_last_event_from_history(self) -> None:
+        """Seed the last event from the local call history after a restart.
+
+        The last event only lives in memory, so after a restart every entity
+        fell back to the cloud event list: the last 20 home events, which
+        other systems on the same home (alarm status changes, for one) push
+        the calls out of within a day or two. The local store keeps each call
+        for days, attributed to the unit that rang rather than the bridge.
+        """
+        if self.history is None or self.data.get(DATA_LAST_EVENT):
+            return
+        records = self.history.list_events(limit=1)
+        if not records:
+            return
+
+        record = records[0]
+        started_at = record.get("timestamp")
+        self.data[DATA_LAST_EVENT] = {
+            "type": record.get("event_type"),
+            "timestamp": datetime.fromtimestamp(started_at, UTC) if started_at else None,
+            "time": record.get("ended_at") or started_at,
+            "module_id": record.get("module_id"),
+            "module_name": record.get("module_name"),
+            "session_id": record.get("event_id"),
+            "event_id": record.get("event_id"),
+        }
+        _LOGGER.debug("Restored last event %s from local history", record.get("event_id"))
+
     async def _close_history_event(self, event_id: str | None, event_type: str) -> None:
         """Close the history record for the given session id."""
         if self.history is None or not event_id:
