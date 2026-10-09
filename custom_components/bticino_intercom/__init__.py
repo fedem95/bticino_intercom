@@ -181,6 +181,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             max_events=max_events,
         )
         coordinator.history = history_store
+        coordinator.restore_last_event_from_history()
 
     # Store everything in hass.data
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
