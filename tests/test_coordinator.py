@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -1036,3 +1036,63 @@ class TestStatusPushWithoutRtcOffer:
 
         assert signals == []
         assert [event["module_id"] for event in events] == [DOORLOCK_ID]
+
+
+# =============================================================================
+# Restoring the last event from local history after a restart
+# =============================================================================
+
+
+class TestRestoreLastEventFromHistory:
+    """The in-memory last event is seeded from the local store on setup."""
+
+    @staticmethod
+    def _history_with(*records: dict) -> MagicMock:
+        history = MagicMock()
+        history.list_events.return_value = list(records)
+        return history
+
+    def test_restores_most_recent_call(self, coordinator: BticinoIntercomCoordinator) -> None:
+        """The newest local record becomes the last event, on the unit that rang."""
+        coordinator.history = self._history_with(
+            {
+                "event_id": SESSION_ID,
+                "module_id": EXTERNAL_UNIT_ID,
+                "module_name": "Posto Esterno",
+                "event_type": EVENT_TYPE_MISSED_CALL,
+                "timestamp": 1791220000,
+                "ended_at": 1791220027,
+            }
+        )
+
+        coordinator.restore_last_event_from_history()
+
+        coordinator.history.list_events.assert_called_once_with(limit=1)
+        last_event = coordinator.data[DATA_LAST_EVENT]
+        assert last_event["type"] == EVENT_TYPE_MISSED_CALL
+        assert last_event["module_id"] == EXTERNAL_UNIT_ID
+        assert last_event["module_name"] == "Posto Esterno"
+        assert last_event["session_id"] == SESSION_ID
+        assert last_event["time"] == 1791220027
+        assert last_event["timestamp"] == datetime.fromtimestamp(1791220000, UTC)
+
+    def test_does_not_override_a_live_event(self, coordinator: BticinoIntercomCoordinator) -> None:
+        """A last event already set in memory is newer than anything on disk."""
+        live = {"type": EVENT_TYPE_INCOMING_CALL, "module_id": EXTERNAL_UNIT_ID}
+        coordinator.data[DATA_LAST_EVENT] = live
+        coordinator.history = self._history_with({"event_id": "old", "event_type": EVENT_TYPE_MISSED_CALL})
+
+        coordinator.restore_last_event_from_history()
+
+        assert coordinator.data[DATA_LAST_EVENT] is live
+
+    @pytest.mark.parametrize("history", [None, "empty"])
+    def test_no_history_leaves_last_event_empty(
+        self, coordinator: BticinoIntercomCoordinator, history: str | None
+    ) -> None:
+        """Without a store, or with an empty one, nothing is invented."""
+        coordinator.history = self._history_with() if history == "empty" else None
+
+        coordinator.restore_last_event_from_history()
+
+        assert coordinator.data[DATA_LAST_EVENT] == {}

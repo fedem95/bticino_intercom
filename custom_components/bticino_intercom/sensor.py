@@ -21,12 +21,34 @@ from .const import (
     DOMAIN,
     EVENT_TYPE_ANSWERED_ELSEWHERE,
     EVENT_TYPE_INCOMING_CALL,
+    EVENT_TYPE_MISSED_CALL,
     EVENT_TYPE_TERMINATED,
 )
 from .coordinator import BticinoIntercomCoordinator
 from .utils import cleanup_orphaned_entities, format_timestamp_iso, format_uptime_readable
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Netatmo re-signs the image URLs on every poll, so these attributes change
+# every few minutes while the state does not. Keeping them out of the recorder
+# stops each poll from storing another copy of two long signed URLs.
+SIGNED_IMAGE_ATTRIBUTES = frozenset(
+    {"snapshot_url", "snapshot_expires_at_iso", "vignette_url", "vignette_expires_at_iso"}
+)
+
+
+def _local_call_records(coordinator: BticinoIntercomCoordinator) -> list[dict[str, Any]]:
+    """Return the calls kept in the local history store, newest first.
+
+    The cloud only returns the last 20 home events, and on homes that share
+    the bridge with an alarm the status changes push calls out of that window
+    within a day or two. The local store keeps every call seen live for the
+    configured retention, so it is the better source whenever it is enabled.
+    """
+    if coordinator.history is None:
+        return []
+    return coordinator.history.list_events()
 
 
 async def async_setup_entry(
@@ -78,6 +100,7 @@ class BticinoEventSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEn
     """Representation of the Last BTicino Event Type."""
 
     _attr_has_entity_name = True
+    _unrecorded_attributes = SIGNED_IMAGE_ATTRIBUTES
 
     def __init__(self, coordinator: BticinoIntercomCoordinator) -> None:
         """Initialize the sensor entity."""
@@ -201,6 +224,7 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
     """Representation of the timestamp of the last completed BTicino call."""
 
     _attr_has_entity_name = True
+    _unrecorded_attributes = SIGNED_IMAGE_ATTRIBUTES
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:phone-clock"
 
@@ -246,12 +270,6 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
             return
 
         events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
-        if not events:
-            self._attr_available = False  # No history to check
-            self._attr_native_value = None
-            self._last_call_event_data = None
-            self._attr_extra_state_attributes = {}
-            return
 
         latest_completed_call = None
         completion_timestamp = None
@@ -278,6 +296,11 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
                 completion_timestamp = potential_completion_time
                 break  # Found the most recent completed call
 
+        local_call = self._latest_local_call()
+        if local_call and local_call["subevents"][0]["time"] > (completion_timestamp or 0):
+            latest_completed_call = local_call
+            completion_timestamp = local_call["subevents"][0]["time"]
+
         if latest_completed_call and completion_timestamp:
             self._attr_available = True
             self._last_call_event_data = latest_completed_call  # Store for attributes
@@ -299,6 +322,26 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
                 self._attr_available = False
                 self._attr_native_value = None
                 self._attr_extra_state_attributes = {}
+
+    def _latest_local_call(self) -> dict[str, Any] | None:
+        """Return the newest locally stored call, shaped like a cloud event."""
+        for record in _local_call_records(self.coordinator):
+            call_time = record.get("ended_at") or record.get("timestamp")
+            if not call_time:
+                continue
+            return {
+                "id": record.get("event_id"),
+                "time": record.get("timestamp"),
+                "module_id": record.get("module_id"),
+                "subevents": [
+                    {
+                        "type": record.get("event_type"),
+                        "time": call_time,
+                        "session_id": record.get("event_id"),
+                    }
+                ],
+            }
+        return None
 
     def _update_attributes(self) -> None:
         """Helper to update attributes from stored event data."""
@@ -350,7 +393,7 @@ class BticinoLastCallTimestampSensor(CoordinatorEntity[BticinoIntercomCoordinato
 
 
 class BticinoCallCountSensor(CoordinatorEntity[BticinoIntercomCoordinator], SensorEntity):
-    """Counts the number of calls in the current event history."""
+    """Counts the calls in the local history, or in the cloud event list without one."""
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:phone-log"
@@ -393,6 +436,16 @@ class BticinoCallCountSensor(CoordinatorEntity[BticinoIntercomCoordinator], Sens
             return
 
         self._attr_available = True
+
+        local_calls = _local_call_records(self.coordinator)
+        if local_calls:
+            self._attr_native_value = len(local_calls)
+            self._attr_extra_state_attributes = {
+                "answered": sum(1 for call in local_calls if call.get("answered")),
+                "missed": sum(1 for call in local_calls if call.get("event_type") == EVENT_TYPE_MISSED_CALL),
+            }
+            return
+
         events = self.coordinator.data.get("events_history", {}).get(self.coordinator.home_id, [])
 
         total = 0
