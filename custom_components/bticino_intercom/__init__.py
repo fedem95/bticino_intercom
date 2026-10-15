@@ -491,6 +491,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Home Assistant starting, scheduling WebSocket manager via listener.")
 
         async def _start_after_ha_start(event: HAEvent) -> None:
+            # The bus drops a one-time listener once it fires. Forget the
+            # remover so a later unload doesn't remove it a second time, which
+            # HA logs as "Unable to remove unknown job listener".
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {})[START_LISTENER_REMOVE_KEY] = None
             # Route through _deferred_start_websocket so we wait for the entry to
             # reach LOADED before starting, exactly like the already-running path.
             # Otherwise the manager could start while the entry is still

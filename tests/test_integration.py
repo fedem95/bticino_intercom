@@ -7,6 +7,7 @@ coordinator, entities, device/entity registries, and lifecycle events.
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
 from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
@@ -14,7 +15,7 @@ from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
 from homeassistant.components.lock import LockState
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
+from homeassistant.const import ATTR_ENTITY_ID, EVENT_HOMEASSISTANT_START, STATE_OFF, STATE_ON
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -611,3 +612,46 @@ async def test_polling_refresh_updates_bridge_sensors(
     await hass.async_block_till_done()
 
     assert int(hass.states.get(wifi_id).state) == -42
+
+
+async def test_reload_after_ha_start_does_not_remove_fired_start_listener(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+    mock_auth_handler: AsyncMock,
+    mock_account: AsyncMock,
+    mock_websocket_client: AsyncMock,
+    mock_signaling_client: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first reload after HA started must not log a core ERROR.
+
+    Set up during HA startup, the entry waits for EVENT_HOMEASSISTANT_START
+    with a one-time listener. Once that fired, unloading used to call its
+    remover again and HA logged "Unable to remove unknown job listener".
+    """
+    assert await hass.config_entries.async_unload(mock_setup_entry.entry_id)
+    await hass.async_block_till_done()
+
+    hass.set_state(CoreState.starting)
+    with (
+        patch("custom_components.bticino_intercom.AuthHandler", return_value=mock_auth_handler),
+        patch("custom_components.bticino_intercom.AsyncAccount", return_value=mock_account),
+        patch("custom_components.bticino_intercom.WebsocketClient", return_value=mock_websocket_client),
+        patch("custom_components.bticino_intercom.SignalingClient", return_value=mock_signaling_client),
+        patch("custom_components.bticino_intercom.Store") as mock_store_cls,
+        patch("custom_components.bticino_intercom._deferred_start_websocket", new_callable=AsyncMock),
+    ):
+        mock_store_cls.return_value.async_load = AsyncMock(return_value=None)
+        mock_store_cls.return_value.async_save = AsyncMock()
+        assert await hass.config_entries.async_setup(mock_setup_entry.entry_id)
+        await hass.async_block_till_done()
+
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_START)
+        await hass.async_block_till_done()
+
+    assert await hass.config_entries.async_unload(mock_setup_entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert mock_setup_entry.state is ConfigEntryState.NOT_LOADED
+    assert "Unable to remove unknown job listener" not in caplog.text
