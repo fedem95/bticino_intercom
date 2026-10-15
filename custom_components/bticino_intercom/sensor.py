@@ -1,10 +1,11 @@
 """Platform for sensor integration."""
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, ClassVar
 
 from homeassistant.components.sensor import (
+    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
@@ -489,7 +490,7 @@ class BticinoBridgeBaseSensor(CoordinatorEntity[BticinoIntercomCoordinator], Sen
         raise NotImplementedError()
 
 
-class BticinoBridgeUptimeSensor(BticinoBridgeBaseSensor):
+class BticinoBridgeUptimeSensor(BticinoBridgeBaseSensor, RestoreSensor):
     """Representation of the Bridge Uptime as a timestamp (boot time)."""
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
@@ -507,6 +508,26 @@ class BticinoBridgeUptimeSensor(BticinoBridgeBaseSensor):
         self._boot_time = None
         self._last_uptime_seconds: int | None = None
         super().__init__(coordinator, bridge_id, bridge_module_data)
+
+    async def async_added_to_hass(self) -> None:
+        """Keep the boot time already recorded while it is still the same boot.
+
+        The boot time is derived from the bridge uptime, which the cloud rounds,
+        so every time the entity is created (HA restart, integration reload) it
+        came out a second or two off and recorded a fake change. Only a real
+        reboot, beyond the drift tolerance, should move it.
+        """
+        await super().async_added_to_hass()
+        if self._boot_time is None:
+            return
+        last_data = await self.async_get_last_sensor_data()
+        restored = last_data.native_value if last_data else None
+        if not isinstance(restored, datetime):
+            return
+        if abs((self._boot_time - restored).total_seconds()) <= BRIDGE_BOOT_TIME_DRIFT_TOLERANCE:
+            self._boot_time = restored
+            self._attr_native_value = restored
+            self.async_write_ha_state()
 
     def _update_state_from_data(self, data: dict[str, Any]) -> None:
         """Update boot timestamp while ignoring normal uptime jitter."""

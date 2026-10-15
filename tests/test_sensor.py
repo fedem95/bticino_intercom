@@ -1,12 +1,16 @@
 """Tests for the BTicino sensor platform."""
 
+from datetime import datetime, timedelta
+
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.core import HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.components.sensor import SensorExtraStoredData
+from homeassistant.core import HomeAssistant, State
+from homeassistant.util.dt import utcnow
+from pytest_homeassistant_custom_component.common import MockConfigEntry, mock_restore_cache_with_extra_data
 
 from custom_components.bticino_intercom.const import DOMAIN
 
-from .conftest import BRIDGE_MAC, EXT_UNIT_MODULE_ID
+from .conftest import BRIDGE_MAC, EXT_UNIT_MODULE_ID, _setup_integration
 
 
 def _get_coordinator(hass: HomeAssistant, entry: MockConfigEntry):
@@ -232,3 +236,80 @@ async def test_sensor_unavailable_on_coordinator_failure(
     if uptime_entity:
         state = hass.states.get(uptime_entity[0])
         assert state.state == "unavailable"
+
+
+BOOT_ENTITY_ID = "sensor.bticino_intercom_test_home_bridge_last_boot"
+
+
+async def _setup_with_restored_boot(
+    hass: HomeAssistant,
+    restored_boot: datetime,
+    mock_config_entry: MockConfigEntry,
+    mock_auth_handler,
+    mock_account,
+    mock_websocket_client,
+    mock_signaling_client,
+) -> None:
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(BOOT_ENTITY_ID, restored_boot.isoformat()),
+                SensorExtraStoredData(restored_boot, None).as_dict(),
+            )
+        ],
+    )
+    await _setup_integration(
+        hass, mock_config_entry, mock_auth_handler, mock_account, mock_websocket_client, mock_signaling_client
+    )
+
+
+async def test_bridge_last_boot_keeps_restored_value_within_tolerance(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_auth_handler,
+    mock_account,
+    mock_websocket_client,
+    mock_signaling_client,
+    enable_custom_integrations: None,
+) -> None:
+    """A re-created entity keeps the recorded boot instead of drifting a second or two."""
+    # The fixture bridge reports 3600 s of uptime; the cloud rounds it, so the
+    # recomputed boot lands a couple of seconds away from the recorded one.
+    restored_boot = (utcnow() - timedelta(seconds=3602)).replace(microsecond=0)
+    await _setup_with_restored_boot(
+        hass,
+        restored_boot,
+        mock_config_entry,
+        mock_auth_handler,
+        mock_account,
+        mock_websocket_client,
+        mock_signaling_client,
+    )
+
+    assert hass.states.get(BOOT_ENTITY_ID).state == restored_boot.isoformat()
+
+
+async def test_bridge_last_boot_ignores_restored_value_after_real_reboot(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_auth_handler,
+    mock_account,
+    mock_websocket_client,
+    mock_signaling_client,
+    enable_custom_integrations: None,
+) -> None:
+    """A recorded boot far from the current uptime means the bridge rebooted."""
+    restored_boot = (utcnow() - timedelta(days=10)).replace(microsecond=0)
+    await _setup_with_restored_boot(
+        hass,
+        restored_boot,
+        mock_config_entry,
+        mock_auth_handler,
+        mock_account,
+        mock_websocket_client,
+        mock_signaling_client,
+    )
+
+    current = datetime.fromisoformat(hass.states.get(BOOT_ENTITY_ID).state)
+    assert abs((current - (utcnow() - timedelta(seconds=3600))).total_seconds()) < 60
