@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -19,6 +19,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.dt import utc_from_timestamp, utcnow
 from pybticino import AsyncAccount, SignalingClient
@@ -43,6 +44,20 @@ ANSWER_TIMEOUT_SECONDS = 20
 # it needs far longer than a live-view offer. The device rings for ~30s (the
 # push events carry expiry=30); allow for that plus the pick-up.
 CALL_HOME_ANSWER_TIMEOUT_SECONDS = 60
+
+
+# Netatmo's TURN credentials are short-lived. The browser receives them when it
+# opens the stream, so keep them fresh in the background rather than at offer
+# time, which would be too late for that session.
+TURN_REFRESH_INTERVAL = timedelta(hours=1)
+
+
+def _candidate_type(candidate: str) -> str:
+    """Return the ICE candidate type (host, srflx, prflx, relay) for logging."""
+    parts = candidate.split()
+    if "typ" in parts and parts.index("typ") + 1 < len(parts):
+        return parts[parts.index("typ") + 1]
+    return "unknown"
 
 
 async def async_setup_entry(
@@ -812,7 +827,9 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
             async def on_candidate(sig_session_id: str, ice: dict) -> None:
                 candidate_str = ice.get("candidate", "")
                 sdp_m_line_index = ice.get("sdp_m_line_index", ice.get("sdpMLineIndex", 0))
-                _LOGGER.debug("Received remote ICE candidate (m=%d)", sdp_m_line_index)
+                _LOGGER.debug(
+                    "Received remote ICE candidate (m=%d, typ=%s)", sdp_m_line_index, _candidate_type(candidate_str)
+                )
                 send_message(
                     WebRTCCandidate(
                         RTCIceCandidateInit(
@@ -826,6 +843,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 error = data.get("data", {}).get("error", {})
                 error_msg = error.get("message", event_type) if error else event_type
                 _LOGGER.warning("Signaling event %s: %s", event_type, error_msg)
+                _LOGGER.debug("Signaling event %s payload: %s", event_type, data)
                 # The device already dropped the session — no answer is coming.
                 self._cancel_answer_watchdog()
                 send_message(WebRTCError(code=event_type, message=error_msg))
@@ -992,6 +1010,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         If the signaling session isn't ready yet, buffer the candidate
         and send it once the session is established.
         """
+        _LOGGER.debug("Browser ICE candidate (typ=%s)", _candidate_type(candidate.candidate))
         if not self._session_ready or not self._signaling.session_id:
             self._pending_candidates.append(candidate)
             return
@@ -1009,9 +1028,15 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         )
 
     async def async_added_to_hass(self) -> None:
-        """Fetch TURN servers when entity is added."""
+        """Fetch TURN servers when entity is added, and keep them fresh."""
         await super().async_added_to_hass()
+        await self._async_refresh_turn_servers()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._async_refresh_turn_servers, TURN_REFRESH_INTERVAL)
+        )
 
+    async def _async_refresh_turn_servers(self, _now: datetime | None = None) -> None:
+        """Fetch TURN credentials; on failure keep the previous ones."""
         try:
             ice_servers_raw = await self._account.async_get_turn_servers()
             self._turn_servers = [

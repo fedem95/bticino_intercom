@@ -1,13 +1,18 @@
 """Tests for the BTicino WebRTC camera entity."""
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
 from homeassistant.components.camera import CameraEntityFeature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util.dt import utcnow
+from pybticino.exceptions import ApiError
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
+from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type
 from custom_components.bticino_intercom.const import DOMAIN
 
 from .conftest import BRIDGE_MAC
@@ -383,3 +388,46 @@ async def test_stale_session_kept_during_active_call(
     camera._cancel_answer_watchdog()
 
     signaling.send_terminate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        ("candidate:1 1 udp 2122260223 192.168.1.10 54400 typ host generation 0", "host"),
+        ("candidate:2 1 udp 1686052607 93.40.1.2 54400 typ srflx raddr 192.168.1.10 rport 54400", "srflx"),
+        ("candidate:3 1 udp 41885439 3.120.0.1 3478 typ relay raddr 93.40.1.2 rport 54400", "relay"),
+        ("", "unknown"),
+        ("candidate:4 1 udp 1 1.2.3.4 5 typ", "unknown"),
+    ],
+)
+def test_candidate_type(candidate: str, expected: str) -> None:
+    """The candidate type is pulled out of the SDP candidate line for the logs."""
+    assert _candidate_type(candidate) == expected
+
+
+async def test_turn_servers_refresh_keeps_previous_on_failure(hass, mock_setup_entry) -> None:
+    """A failed refresh must not wipe credentials that may still be valid."""
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera._account.async_get_turn_servers = AsyncMock(
+        return_value=[{"urls": ["turn:turn.example:3478"], "username": "u1", "credential": "p1"}]
+    )
+    await camera._async_refresh_turn_servers()
+    assert [server.username for server in camera._turn_servers] == ["u1"]
+
+    camera._account.async_get_turn_servers = AsyncMock(side_effect=ApiError(502, "Bad Gateway"))
+    await camera._async_refresh_turn_servers()
+    assert [server.username for server in camera._turn_servers] == ["u1"]
+
+
+async def test_turn_servers_are_refreshed_periodically(hass, mock_setup_entry) -> None:
+    """Short-lived TURN credentials are fetched again on a timer."""
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera._account.async_get_turn_servers = AsyncMock(
+        return_value=[{"urls": ["turn:turn.example:3478"], "username": "fresh", "credential": "p"}]
+    )
+
+    async_fire_time_changed(hass, utcnow() + TURN_REFRESH_INTERVAL + timedelta(seconds=1))
+    await hass.async_block_till_done()
+
+    assert camera._account.async_get_turn_servers.await_count >= 1
+    assert [server.username for server in camera._turn_servers] == ["fresh"]
