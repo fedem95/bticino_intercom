@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import io
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 from homeassistant.core import HomeAssistant
+from PIL import Image
+from turbojpeg import TJCS_RGB, TJCS_YCbCr, TurboJPEG
 
-from custom_components.bticino_intercom.history import EventHistoryStore
+from custom_components.bticino_intercom.history import EventHistoryStore, normalize_event_jpeg
 
 
 class _FakeResponse:
@@ -427,3 +430,41 @@ async def test_list_modules_empty_store(
         await store.async_load()
 
     assert store.list_modules() == []
+
+
+def _rgb_coded_jpeg() -> bytes:
+    """Return a JPEG stored as RGB (Adobe transform 0), like the intercom's."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (200, 40, 40)).save(buffer, "JPEG", keep_rgb=True)
+    return buffer.getvalue()
+
+
+def test_normalize_event_jpeg_reencodes_rgb_jpeg_as_ycbcr() -> None:
+    """An RGB-coded JPEG comes back as a standard YCbCr one with the same colours."""
+    data = _rgb_coded_jpeg()
+    assert TurboJPEG().decode_header(data)[3] == TJCS_RGB
+
+    normalized = normalize_event_jpeg(data)
+
+    assert TurboJPEG().decode_header(normalized)[3] == TJCS_YCbCr
+    red, green, blue = Image.open(io.BytesIO(normalized)).getpixel((16, 16))
+    assert red > 180 and green < 70 and blue < 70
+    assert normalize_event_jpeg(normalized) is normalized
+
+
+@pytest.mark.parametrize(
+    "data",
+    [b"\x89PNG\r\n\x1a\nnot a jpeg", b"\xff\xd8\xff\xee\x00", b""],
+    ids=["png", "truncated", "empty"],
+)
+def test_normalize_event_jpeg_leaves_other_data_alone(data: bytes) -> None:
+    """Anything that isn't an RGB-coded JPEG is returned unchanged."""
+    assert normalize_event_jpeg(data) is data
+
+
+def test_normalize_event_jpeg_leaves_standard_jpeg_alone() -> None:
+    """A regular YCbCr JPEG is not re-encoded."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (200, 40, 40)).save(buffer, "JPEG")
+    data = buffer.getvalue()
+    assert normalize_event_jpeg(data) is data
