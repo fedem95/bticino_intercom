@@ -324,13 +324,15 @@ intercoms:
 | Chrome / Chromium (Desktop) | Supported | Full video + audio |
 | Chrome (Android) | Supported | Full video + audio |
 | Edge (Chromium) | Supported | Full video + audio |
-| Safari / iOS (any browser) | Not supported | All iOS browsers use WebKit. The BTicino device firmware uses Chrome-specific RTP payload types — see [Firefox investigation](docs/firefox-webrtc-investigation.md) |
+| Safari / iOS (any browser) | Depends on the device | Classe 100X (BNC1): not supported — all iOS browsers use WebKit and the BNC1 firmware uses Chrome-specific RTP payload types, see [Firefox investigation](docs/firefox-webrtc-investigation.md). Classe 300 EOS (BNCX): video and two-way audio work (see note below) |
 | Firefox | Not supported | Device firmware bug: hardcoded Chrome RTP payload types (PT=111/Opus, PT=109/H264) |
 | HA Companion (Android) | Supported | Uses system WebView (Chromium) |
-| HA Companion (iOS) | Not supported | Uses WebKit (same limitation as Safari) |
+| HA Companion (iOS) | Depends on the device | Uses WebKit: same as Safari above |
 
 > [!NOTE]
 > The browser limitation is caused by the BTicino device firmware (BNC1), which hardcodes Chrome/libwebrtc RTP payload type numbers in its media engine regardless of SDP negotiation. This cannot be fixed from the integration side. The official Netatmo app works on iOS because it bundles the same `libwebrtc` engine as Chrome, not because it does any special handling.
+>
+> On a Classe 300 EOS (BNCX) bridge, live video with two-way audio (speaker and microphone) has been tested working on an iPhone 15 Pro Max (iOS 27.0.1, HA Companion app), at home and on 5G, using the [bticino-intercom-card](https://github.com/k-the-hidden-hero/bticino_ha_extras). The camera's standard more-info dialog shows the video but starts muted and has no microphone, so use the card for audio.
 
 ### Reporting issues
 
