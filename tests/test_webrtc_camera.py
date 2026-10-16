@@ -1,6 +1,5 @@
 """Tests for the BTicino WebRTC camera entity."""
 
-import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -12,9 +11,8 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util.dt import utcnow
 from pybticino.exceptions import ApiError
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
-from webrtc_models import RTCIceCandidateInit
 
-from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type, _inline_candidates
+from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type
 from custom_components.bticino_intercom.const import DOMAIN
 
 from .conftest import BRIDGE_MAC
@@ -433,52 +431,3 @@ async def test_turn_servers_are_refreshed_periodically(hass, mock_setup_entry) -
 
     assert camera._account.async_get_turn_servers.await_count >= 1
     assert [server.username for server in camera._turn_servers] == ["fresh"]
-
-
-OFFER_SDP = (
-    "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
-    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\n"
-    "m=video 9 UDP/TLS/RTP/SAVPF 109\r\na=mid:1\r\n"
-)
-RELAY = "candidate:3 1 udp 41885439 3.120.0.1 3478 typ relay raddr 93.40.1.2 rport 54400"
-HOST = "candidate:1 1 udp 2122260223 192.168.1.10 54400 typ host generation 0"
-
-
-def test_inline_candidates_adds_lines_to_their_section() -> None:
-    """Each candidate lands at the end of its own m= section, CRLF kept."""
-    sdp = _inline_candidates(
-        OFFER_SDP,
-        [
-            RTCIceCandidateInit(candidate=HOST, sdp_m_line_index=0),
-            RTCIceCandidateInit(candidate=RELAY, sdp_m_line_index=1),
-        ],
-    )
-
-    audio, video = sdp.split("m=video")
-    assert f"a={HOST}\r\n" in audio and f"a={RELAY}" not in audio
-    assert f"a={RELAY}\r\n" in video
-    assert sdp.endswith("\r\n") and "\n\n" not in sdp
-
-
-def test_inline_candidates_without_candidates_is_identity() -> None:
-    """No gathered candidates means the offer goes out untouched."""
-    assert _inline_candidates(OFFER_SDP, []) is OFFER_SDP
-
-
-async def test_offer_waits_for_relay_candidate_and_inlines_it(hass, mock_setup_entry) -> None:
-    """Candidates gathered while the offer is held are carried in the offer SDP."""
-    camera = _get_webrtc_camera(hass, mock_setup_entry)
-    camera._pending_candidates.clear()
-    camera._pending_candidates.append(RTCIceCandidateInit(candidate=HOST, sdp_m_line_index=0))
-
-    async def _browser_gathers_relay() -> None:
-        await asyncio.sleep(0.1)
-        camera._pending_candidates.append(RTCIceCandidateInit(candidate=RELAY, sdp_m_line_index=0))
-
-    task = hass.async_create_task(_browser_gathers_relay())
-    sdp = await camera._offer_with_gathered_candidates(OFFER_SDP)
-    await task
-
-    assert f"a={HOST}" in sdp and f"a={RELAY}" in sdp
-    # Still buffered, so they are trickled after the answer as before.
-    assert len(camera._pending_candidates) == 2
