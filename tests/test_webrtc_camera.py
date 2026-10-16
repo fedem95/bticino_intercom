@@ -463,3 +463,14 @@ async def test_mdns_candidate_is_not_buffered_or_sent(hass, mock_setup_entry) ->
     )
 
     assert camera._pending_candidates == []
+
+
+async def test_live_camera_image_is_a_placeholder(hass, mock_setup_entry) -> None:
+    """The live view shows a 'press play' card, not an old ring snapshot."""
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+
+    image = await camera.async_camera_image()
+
+    assert image is not None and image.startswith(b"\x89PNG\r\n\x1a\n")
+    assert camera.content_type == "image/png"
+    assert await camera.async_camera_image() is image

@@ -96,6 +96,25 @@ def _is_forwardable_candidate(candidate: str) -> bool:
     return not (address.endswith(".local") or address.startswith("127.") or address == "::1")
 
 
+def _placeholder_png(title: str, subtitle: str, subtitle_color: tuple[int, int, int]) -> bytes:
+    """Render a 640x480 placeholder card. Blocking: call from the executor."""
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    width, height = 640, 480
+    img = Image.new("RGB", (width, height), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font_title = ImageFont.load_default(size=42)
+    font_sub = ImageFont.load_default(size=28)
+    draw.text((width / 2, height / 2 - 40), title, fill=(255, 255, 255), font=font_title, anchor="mm")
+    draw.text((width / 2, height / 2 + 20), subtitle, fill=subtitle_color, font=font_sub, anchor="mm")
+    draw.rectangle([15, 15, width - 15, height - 15], outline=(60, 60, 60), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -409,7 +428,6 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         self._signaling_session_id: str | None = None
         # Watchdog that frees the device peer slot when no answer ever arrives
         self._answer_watchdog: asyncio.Task | None = None
-        self._poster_event_id: str | None = None
         self._poster_bytes: bytes | None = None
 
     @property
@@ -433,32 +451,18 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         return self.coordinator.last_update_success and self.coordinator.main_device_id is not None
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
-        """Return the most recent snapshot for this module from local history."""
-        from .history import EventHistoryStore
+        """Return a "press play" card for the live view.
 
-        store: EventHistoryStore | None = (
-            self.hass.data.get(DOMAIN, {}).get(self.coordinator.entry.entry_id, {}).get("history")
-        )
-
-        if store is not None:
-            events = store.list_events(module_id=self._module_id, limit=1)
-            if events:
-                event = events[0]
-                eid = event.get("event_id")
-                if eid == self._poster_event_id and self._poster_bytes:
-                    return self._poster_bytes
-                path = store.resolve_image_path(eid, "snapshot")
-                if path is not None:
-                    try:
-                        data = await self.hass.async_add_executor_job(path.read_bytes)
-                        self.content_type = _image_content_type(data)
-                        self._poster_event_id = eid
-                        self._poster_bytes = data
-                        return data
-                    except OSError:
-                        _LOGGER.debug("Failed to read poster from %s", path)
-
-        return None
+        This entity is the live stream. Showing the last ring's snapshot here
+        made an old picture look like the current view of the door until
+        play was pressed; the snapshot has its own camera entity.
+        """
+        if self._poster_bytes is None:
+            self._poster_bytes = await self.hass.async_add_executor_job(
+                _placeholder_png, str(self._attr_name).upper(), "LIVE  -  PRESS PLAY", (0, 160, 60)
+            )
+            self.content_type = "image/png"
+        return self._poster_bytes
 
     # --- SDP manipulation methods ---
     #
@@ -1194,18 +1198,4 @@ class BticinoCallHomeCamera(BticinoWebRTCCamera):
 
     @staticmethod
     def _generate_poster() -> bytes:
-        import io
-
-        from PIL import Image, ImageDraw, ImageFont
-
-        width, height = 640, 480
-        img = Image.new("RGB", (width, height), color=(0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        font_title = ImageFont.load_default(size=42)
-        font_sub = ImageFont.load_default(size=28)
-        draw.text((width / 2, height / 2 - 40), "CALL HOME", fill=(255, 255, 255), font=font_title, anchor="mm")
-        draw.text((width / 2, height / 2 + 20), "VOICE ONLY", fill=(180, 0, 0), font=font_sub, anchor="mm")
-        draw.rectangle([15, 15, width - 15, height - 15], outline=(60, 60, 60), width=2)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return _placeholder_png("CALL HOME", "VOICE ONLY", (180, 0, 0))
