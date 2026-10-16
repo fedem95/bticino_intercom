@@ -55,6 +55,58 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+def _is_rgb_jpeg(data: bytes) -> bool:
+    """Return whether ``data`` is a JPEG whose scan is stored as RGB, not YCbCr.
+
+    Read from the header only: an Adobe APP14 segment with ``transform=0`` or
+    three components named R, G and B both mean the scan is plain RGB.
+    """
+    if not data.startswith(b"\xff\xd8"):
+        return False
+    pos = 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        marker = data[pos + 1]
+        if marker == 0xDA:  # start of scan: the header is over
+            return False
+        length = int.from_bytes(data[pos + 2 : pos + 4], "big")
+        segment_end = pos + 2 + length
+        if length < 2 or segment_end > len(data):
+            return False
+        payload = data[pos + 4 : segment_end]
+        if marker == 0xEE and payload.startswith(b"Adobe") and len(payload) >= 12 and payload[11] == 0:
+            return True
+        if marker in (0xC0, 0xC1, 0xC2) and len(payload) >= 15 and payload[5] == 3:
+            return bytes(payload[6:15:3]) == b"RGB"
+        pos = segment_end
+    return False
+
+
+def normalize_event_jpeg(data: bytes) -> bytes:
+    """Re-encode an RGB-coded JPEG as a standard YCbCr one.
+
+    The intercom stores its snapshots as RGB JPEGs (components R, G, B, Adobe
+    transform 0). They decode fine, but Home Assistant scales camera thumbnails
+    through the YUV planes, which assumes YCbCr: on these files it reads R, G, B
+    as Y, Cb, Cr and the preview turns green and magenta. A YCbCr JPEG is what
+    every consumer expects. Anything else is returned unchanged. Blocking: call
+    from the executor.
+    """
+    if not _is_rgb_jpeg(data):
+        return data
+
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            buffer = io.BytesIO()
+            image.convert("RGB").save(buffer, "JPEG", quality=92)
+    except (OSError, ValueError):
+        return data
+    return buffer.getvalue()
+
+
 class EventHistoryStore:
     """Persist doorbell events with their associated images."""
 
@@ -86,6 +138,7 @@ class EventHistoryStore:
             if isinstance(events, list):
                 self._events = [e for e in events if isinstance(e, dict)]
         await self.hass.async_add_executor_job(self._ensure_root)
+        await self.hass.async_add_executor_job(self._normalize_stored_images)
         self._loaded = True
         _LOGGER.debug("Loaded %d historical events for entry %s", len(self._events), self.entry_id)
 
@@ -286,6 +339,26 @@ class EventHistoryStore:
             await self.hass.async_add_executor_job(self._rmtree, self._root)
             await self.hass.async_add_executor_job(self._ensure_root)
 
+    def _normalize_stored_images(self) -> None:
+        """Re-encode images stored before RGB JPEGs were normalized on download."""
+        converted = 0
+        for event in self._events:
+            for kind in IMAGE_KINDS:
+                rel = event.get(f"{kind}_file")
+                if not rel:
+                    continue
+                path = self._root / rel
+                try:
+                    data = path.read_bytes()
+                    normalized = normalize_event_jpeg(data)
+                    if normalized is not data:
+                        path.write_bytes(normalized)
+                        converted += 1
+                except OSError:
+                    continue
+        if converted:
+            _LOGGER.info("Re-encoded %d stored RGB event images as standard JPEG", converted)
+
     def _ensure_root(self) -> None:
         """Create the storage directory if it does not exist."""
         self._root.mkdir(parents=True, exist_ok=True)
@@ -337,7 +410,7 @@ class EventHistoryStore:
 
         def _write() -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+            target.write_bytes(normalize_event_jpeg(data))
 
         try:
             await self.hass.async_add_executor_job(_write)
