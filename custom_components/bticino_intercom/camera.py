@@ -78,6 +78,35 @@ def _candidate_type(candidate: str) -> str:
     return "unknown"
 
 
+# How long to hold the offer while the browser gathers its candidates. The
+# browser has its relay candidates within a few hundred milliseconds; waiting
+# for them lets the offer carry them, instead of trickling them right after
+# the device's answer, where the device appears to ignore them and only
+# connects once its own relay candidates are ready, 5-10 s later.
+OFFER_CANDIDATE_WAIT = 1.0
+OFFER_CANDIDATE_POLL = 0.05
+
+
+def _inline_candidates(sdp: str, candidates: list[RTCIceCandidateInit]) -> str:
+    """Return ``sdp`` with ``candidates`` added as a=candidate lines per m= section."""
+    if not candidates:
+        return sdp
+    newline = "\r\n" if "\r\n" in sdp else "\n"
+    lines = sdp.rstrip("\r\n").split(newline)
+    sections: list[list[str]] = [[]]
+    for line in lines:
+        if line.startswith("m="):
+            sections.append([])
+        sections[-1].append(line)
+    for candidate in candidates:
+        index = (candidate.sdp_m_line_index or 0) + 1
+        if candidate.candidate and index < len(sections):
+            line = candidate.candidate if candidate.candidate.startswith("a=") else f"a={candidate.candidate}"
+            if line not in sections[index]:
+                sections[index].append(line)
+    return newline.join(line for section in sections for line in section) + newline
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -780,6 +809,26 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         """
         return offer_sdp.replace("a=setup:actpass", "a=setup:active")
 
+    async def _offer_with_gathered_candidates(self, offer_sdp: str) -> str:
+        """Wait briefly for the browser's relay candidates and inline them in the offer.
+
+        The candidates stay buffered and are still trickled after the answer,
+        so a device that does use trickled candidates sees no change.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OFFER_CANDIDATE_WAIT
+        while loop.time() < deadline and not any(
+            _candidate_type(candidate.candidate) == "relay" for candidate in self._pending_candidates
+        ):
+            await asyncio.sleep(OFFER_CANDIDATE_POLL)
+        candidates = list(self._pending_candidates)
+        _LOGGER.debug(
+            "Inlining %d browser ICE candidates in the offer (%s)",
+            len(candidates),
+            ", ".join(sorted({_candidate_type(c.candidate) for c in candidates})) or "none",
+        )
+        return _inline_candidates(offer_sdp, candidates)
+
     async def _flush_pending_candidates(self) -> None:
         """Send all buffered ICE candidates now that the session is ready."""
         if not self._pending_candidates:
@@ -945,7 +994,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 # the peer on the device until it times out (issue #58 / #60).
                 offer_session_id = await self._signaling.send_offer(
                     device_id=device_id,
-                    sdp=offer_sdp,
+                    sdp=await self._offer_with_gathered_candidates(offer_sdp),
                     module_id=self._module_id,
                 )
                 if offer_session_id:
