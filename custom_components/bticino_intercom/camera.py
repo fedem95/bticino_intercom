@@ -60,6 +60,24 @@ def _candidate_type(candidate: str) -> str:
     return "unknown"
 
 
+def _is_forwardable_candidate(candidate: str) -> bool:
+    """Return whether a browser ICE candidate is worth sending to the device.
+
+    Mirrors the official app, which forwards only UDP, non-loopback candidates.
+    Browsers also produce TCP candidates and mDNS host candidates (a random
+    ``<uuid>.local`` name instead of the LAN address); the device can use
+    neither, and with them in the exchange it took about 10 s to send its own
+    candidates, so remote live view started late.
+    """
+    parts = candidate.removeprefix("a=").split()
+    if len(parts) < 6:
+        return True
+    transport, address = parts[2].lower(), parts[4].lower()
+    if transport != "udp":
+        return False
+    return not (address.endswith(".local") or address.startswith("127.") or address == "::1")
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -1010,6 +1028,9 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         If the signaling session isn't ready yet, buffer the candidate
         and send it once the session is established.
         """
+        if not _is_forwardable_candidate(candidate.candidate):
+            _LOGGER.debug("Dropping browser ICE candidate the device can't use: %s", candidate.candidate)
+            return
         _LOGGER.debug("Browser ICE candidate (typ=%s)", _candidate_type(candidate.candidate))
         if not self._session_ready or not self._signaling.session_id:
             self._pending_candidates.append(candidate)
