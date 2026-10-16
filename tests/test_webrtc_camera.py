@@ -11,8 +11,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util.dt import utcnow
 from pybticino.exceptions import ApiError
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
+from webrtc_models import RTCIceCandidateInit
 
-from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type
+from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type, _is_forwardable_candidate
 from custom_components.bticino_intercom.const import DOMAIN
 
 from .conftest import BRIDGE_MAC
@@ -431,3 +432,34 @@ async def test_turn_servers_are_refreshed_periodically(hass, mock_setup_entry) -
 
     assert camera._account.async_get_turn_servers.await_count >= 1
     assert [server.username for server in camera._turn_servers] == ["fresh"]
+
+
+@pytest.mark.parametrize(
+    ("candidate", "forward"),
+    [
+        ("candidate:1 1 udp 2122260223 192.168.1.10 54400 typ host generation 0", True),
+        ("candidate:3 1 udp 41885439 3.120.0.1 3478 typ relay raddr 93.40.1.2 rport 54400", True),
+        ("candidate:1 1 udp 2122260223 4f2c1e7a-0b7d-4c1e-9d2a-1b2c3d4e5f60.local 54400 typ host", False),
+        ("candidate:5 1 tcp 1518280447 192.168.1.10 9 typ host tcptype active", False),
+        ("candidate:6 1 udp 2122260223 127.0.0.1 54400 typ host", False),
+        ("a=candidate:1 1 UDP 2122260223 192.168.1.10 54400 typ host", True),
+        ("", True),
+    ],
+)
+def test_is_forwardable_candidate(candidate: str, forward: bool) -> None:
+    """Only UDP, non-loopback, non-mDNS candidates go to the device, like the app."""
+    assert _is_forwardable_candidate(candidate) is forward
+
+
+async def test_mdns_candidate_is_not_buffered_or_sent(hass, mock_setup_entry) -> None:
+    """A dropped candidate never reaches the device, before or after the answer."""
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera._pending_candidates.clear()
+    camera._session_ready = False
+
+    await camera.async_on_webrtc_candidate(
+        "sess",
+        RTCIceCandidateInit(candidate="candidate:1 1 udp 1 abcd.local 5 typ host", sdp_m_line_index=0),
+    )
+
+    assert camera._pending_candidates == []
