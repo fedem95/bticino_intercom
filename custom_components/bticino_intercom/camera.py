@@ -6,6 +6,7 @@ import re
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from aiohttp import web
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -113,6 +114,38 @@ def _placeholder_png(title: str, subtitle: str, subtitle_color: tuple[int, int, 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# The first live view after a pause often got no answer from the device, the
+# second one a minute later worked. The signaling subscription is re-sent with a
+# fresh token right before the offer without waiting for the server to take it,
+# and a connection that sat idle for hours may no longer be honoured at all.
+# After this much idle time, reopen the connection from scratch instead:
+# connect() waits for the server's subscribe "ok" before the offer goes out.
+SIGNALING_IDLE_RECONNECT = 300  # seconds
+_signaling_last_used: WeakKeyDictionary[SignalingClient, float] = WeakKeyDictionary()
+
+
+async def _async_prepare_signaling(signaling: SignalingClient, active_call: dict[str, Any] | None) -> None:
+    """Get the shared signaling client ready for a new session."""
+    now = asyncio.get_running_loop().time()
+    last_used = _signaling_last_used.get(signaling)
+    if last_used is None or now - last_used > SIGNALING_IDLE_RECONNECT:
+        _LOGGER.debug("Signaling idle, reopening the connection before the session")
+        await signaling.disconnect()
+        await signaling.connect()
+        if active_call and active_call.get("session_id"):
+            # disconnect() clears the session an incoming call put there.
+            signaling.set_session_from_push(
+                session_id=active_call["session_id"],
+                tag_id=active_call.get("tag_id") or "",
+                correlation_id=str(active_call.get("correlation_id") or ""),
+                device_id=active_call.get("device_id") or "",
+            )
+    else:
+        await signaling.ensure_connected()
+        await signaling.resubscribe()
+    _signaling_last_used[signaling] = now
 
 
 async def async_setup_entry(
@@ -865,9 +898,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         browser_offer_sdp = offer_sdp
 
         try:
-            # Ensure signaling is connected with a fresh token
-            await self._signaling.ensure_connected()
-            await self._signaling.resubscribe()
+            await _async_prepare_signaling(self._signaling, self.coordinator.active_call)
 
             # Set up callbacks for this session
             async def on_answer(sig_session_id: str, sdp: str) -> None:

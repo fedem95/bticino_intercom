@@ -1,7 +1,7 @@
 """Tests for the BTicino WebRTC camera entity."""
 
 from datetime import timedelta
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.camera import DOMAIN as CAMERA_DOMAIN
@@ -13,7 +13,14 @@ from pybticino.exceptions import ApiError
 from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 from webrtc_models import RTCIceCandidateInit
 
-from custom_components.bticino_intercom.camera import TURN_REFRESH_INTERVAL, _candidate_type, _is_forwardable_candidate
+from custom_components.bticino_intercom.camera import (
+    SIGNALING_IDLE_RECONNECT,
+    TURN_REFRESH_INTERVAL,
+    _async_prepare_signaling,
+    _candidate_type,
+    _is_forwardable_candidate,
+    _signaling_last_used,
+)
 from custom_components.bticino_intercom.const import DOMAIN
 
 from .conftest import BRIDGE_MAC
@@ -474,3 +481,47 @@ async def test_live_camera_image_is_a_placeholder(hass, mock_setup_entry) -> Non
     assert image is not None and image.startswith(b"\x89PNG\r\n\x1a\n")
     assert camera.content_type == "image/png"
     assert await camera.async_camera_image() is image
+
+
+async def test_signaling_reopened_when_idle_and_resubscribed_when_recent() -> None:
+    """After a pause the connection is reopened; right after use it is only refreshed."""
+    signaling = AsyncMock()
+
+    await _async_prepare_signaling(signaling, None)
+
+    signaling.disconnect.assert_awaited_once()
+    signaling.connect.assert_awaited_once()
+    signaling.resubscribe.assert_not_awaited()
+
+    signaling.reset_mock()
+    await _async_prepare_signaling(signaling, None)
+
+    signaling.disconnect.assert_not_awaited()
+    signaling.connect.assert_not_awaited()
+    signaling.ensure_connected.assert_awaited_once()
+    signaling.resubscribe.assert_awaited_once()
+
+
+async def test_signaling_reopened_after_idle_timeout() -> None:
+    """A connection idle for longer than the threshold is reopened again."""
+    signaling = AsyncMock()
+    await _async_prepare_signaling(signaling, None)
+    _signaling_last_used[signaling] -= SIGNALING_IDLE_RECONNECT + 1
+    signaling.reset_mock()
+
+    await _async_prepare_signaling(signaling, None)
+
+    signaling.connect.assert_awaited_once()
+
+
+async def test_signaling_reopen_keeps_incoming_call_session() -> None:
+    """Reopening clears the session, so an incoming call's session is put back."""
+    signaling = AsyncMock()
+    signaling.set_session_from_push = MagicMock()
+    active_call = {"session_id": "sess-1", "tag_id": "tag", "correlation_id": 42, "device_id": "00:03:50:00:00:01"}
+
+    await _async_prepare_signaling(signaling, active_call)
+
+    signaling.set_session_from_push.assert_called_once_with(
+        session_id="sess-1", tag_id="tag", correlation_id="42", device_id="00:03:50:00:00:01"
+    )
