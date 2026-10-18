@@ -9,6 +9,6 @@
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/k-the-hidden-hero/bticino_intercom/issues",
   "loggers": ["pybticino"],
-  "requirements": ["pybticino>=1.9.0"],
-  "version": "2.0.4-rc1"
+  "requirements": ["pybticino @ https://github.com/fedem95/pybticino/releases/download/v1.9.1rc1/pybticino-1.9.1rc1-py3-none-any.whl"],
+  "version": "2.0.4-rc7"
 }
