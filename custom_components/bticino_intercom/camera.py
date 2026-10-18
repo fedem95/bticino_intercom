@@ -123,6 +123,14 @@ def _placeholder_png(title: str, subtitle: str, subtitle_color: tuple[int, int, 
 # After this much idle time, reopen the connection from scratch instead:
 # connect() waits for the server's subscribe "ok" before the offer goes out.
 SIGNALING_IDLE_RECONNECT = 300  # seconds
+
+# A Classe 300 EOS announces a ring with status pushes only: there is no device
+# offer to answer, so a live view opened while it rings is a new peer, and the
+# device refuses it until the ring ends. Ending the ringing session first frees
+# the slot, and a fresh offer then reaches the external unit — the call is in
+# effect answered from Home Assistant.
+MAX_PEERS_ERROR = "Max number of peers reached"
+RINGING_TAKEOVER_DELAY = 1.5  # seconds between ending the ring and the new offer
 _signaling_last_used: WeakKeyDictionary[SignalingClient, float] = WeakKeyDictionary()
 
 
@@ -938,13 +946,22 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                     )
                 )
 
+            took_over_ring = False
+
             async def on_event(sig_session_id: str, event_type: str, data: dict) -> None:
+                nonlocal took_over_ring
                 error = data.get("data", {}).get("error", {})
                 error_msg = error.get("message", event_type) if error else event_type
-                _LOGGER.warning("Signaling event %s: %s", event_type, error_msg)
                 _LOGGER.debug("Signaling event %s payload: %s", event_type, data)
                 # The device already dropped the session — no answer is coming.
                 self._cancel_answer_watchdog()
+                ringing = self._ringing_status_only_call()
+                if error_msg == MAX_PEERS_ERROR and ringing and not took_over_ring:
+                    took_over_ring = True
+                    _LOGGER.info("Device busy with a ringing call; ending the ring to open the live view")
+                    self.hass.async_create_task(self._async_take_over_ring(ringing, device_id, offer_sdp, send_message))
+                    return
+                _LOGGER.warning("Signaling event %s: %s", event_type, error_msg)
                 send_message(WebRTCError(code=event_type, message=error_msg))
 
             self._signaling._on_answer = on_answer
@@ -1020,6 +1037,43 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         except Exception as err:
             _LOGGER.exception("Failed to handle WebRTC offer")
             send_message(WebRTCError(code="offer_failed", message=str(err)))
+
+    def _ringing_status_only_call(self) -> dict[str, Any] | None:
+        """Return the ringing status-only call on this camera's unit, if any."""
+        call = self.coordinator.active_call
+        if call and call.get("status_only") and call.get("session_id") and call.get("module_id") == self._module_id:
+            return call
+        return None
+
+    async def _async_take_over_ring(
+        self,
+        ringing: dict[str, Any],
+        device_id: str,
+        offer_sdp: str,
+        send_message: WebRTCSendMessage,
+    ) -> None:
+        """End the ringing session, then send the live view offer again."""
+        try:
+            self._signaling.set_session_from_push(
+                session_id=ringing["session_id"],
+                tag_id=ringing.get("tag_id") or "",
+                correlation_id=str(ringing.get("correlation_id") or ""),
+                device_id=ringing.get("device_id") or device_id,
+            )
+            await self._signaling.send_terminate()
+            await asyncio.sleep(RINGING_TAKEOVER_DELAY)
+            offer_session_id = await self._signaling.send_offer(
+                device_id=device_id,
+                sdp=offer_sdp,
+                module_id=self._module_id,
+            )
+        except Exception as err:
+            _LOGGER.warning("Could not open the live view after ending the ring: %s", err)
+            send_message(WebRTCError(code="offer_failed", message=str(err)))
+            return
+        if offer_session_id:
+            self._signaling_session_id = offer_session_id
+            self._arm_answer_watchdog(offer_session_id, send_message)
 
     async def _release_stale_session(self) -> None:
         """Terminate a session this camera left behind on an earlier attempt.

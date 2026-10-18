@@ -1,5 +1,6 @@
 """Tests for the BTicino WebRTC camera entity."""
 
+import asyncio
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -525,3 +526,90 @@ async def test_signaling_reopen_keeps_incoming_call_session() -> None:
     signaling.set_session_from_push.assert_called_once_with(
         session_id="sess-1", tag_id="tag", correlation_id="42", device_id="00:03:50:00:00:01"
     )
+
+
+def _ringing_status_call(camera) -> dict:
+    return {
+        "session_id": "ring-sess",
+        "tag_id": "ring-tag",
+        "correlation_id": None,
+        "device_id": "00:03:50:00:00:01",
+        "module_id": camera._module_id,
+        "sdp": None,
+        "modules": [],
+        "status_only": True,
+    }
+
+
+async def test_busy_device_during_status_only_ring_ends_the_ring_and_retries(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """EOS: a live view refused while the unit rings ends the ring and offers again."""
+    from homeassistant.components.camera.webrtc import WebRTCError
+
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera.coordinator._active_call = _ringing_status_call(camera)
+    signaling = _prep_offer_signaling(hass, mock_setup_entry, session_id="sess_busy")
+    signaling.set_session_from_push = MagicMock()
+
+    messages = []
+    with patch("custom_components.bticino_intercom.camera.RINGING_TAKEOVER_DELAY", 0):
+        await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
+        await signaling._on_event(
+            "sess_busy", "terminate", {"data": {"error": {"message": "Max number of peers reached"}}}
+        )
+        for _ in range(5):  # let the takeover task run, not the answer watchdog
+            await asyncio.sleep(0)
+
+    assert not any(isinstance(m, WebRTCError) for m in messages), messages
+    signaling.set_session_from_push.assert_called_with(
+        session_id="ring-sess", tag_id="ring-tag", correlation_id="", device_id="00:03:50:00:00:01"
+    )
+    signaling.send_terminate.assert_awaited_once()
+    assert signaling.send_offer.await_count == 2
+    camera._cancel_answer_watchdog()
+
+
+async def test_busy_device_after_ring_takeover_reports_the_error(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """The ring is ended only once per view; a second refusal reaches the frontend."""
+    from homeassistant.components.camera.webrtc import WebRTCError
+
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera.coordinator._active_call = _ringing_status_call(camera)
+    signaling = _prep_offer_signaling(hass, mock_setup_entry, session_id="sess_busy")
+    signaling.set_session_from_push = MagicMock()
+    busy = {"data": {"error": {"message": "Max number of peers reached"}}}
+
+    messages = []
+    with patch("custom_components.bticino_intercom.camera.RINGING_TAKEOVER_DELAY", 0):
+        await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
+        await signaling._on_event("sess_busy", "terminate", busy)
+        for _ in range(5):  # let the takeover task run, not the answer watchdog
+            await asyncio.sleep(0)
+        await signaling._on_event("sess_busy", "terminate", busy)
+
+    assert any(isinstance(m, WebRTCError) for m in messages)
+    signaling.send_terminate.assert_awaited_once()
+
+
+async def test_busy_device_without_ring_reports_the_error(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """With no ringing call there is nothing to end: the refusal is reported."""
+    from homeassistant.components.camera.webrtc import WebRTCError
+
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera.coordinator._active_call = None
+    signaling = _prep_offer_signaling(hass, mock_setup_entry, session_id="sess_busy")
+
+    messages = []
+    await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
+    await signaling._on_event("sess_busy", "terminate", {"data": {"error": {"message": "Max number of peers reached"}}})
+
+    assert any(isinstance(m, WebRTCError) for m in messages)
+    assert signaling.send_offer.await_count == 1
