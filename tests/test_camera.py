@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from homeassistant.components.camera import _async_get_image
+from homeassistant.components.camera import Camera, _async_get_image
 from homeassistant.core import HomeAssistant
 
 from custom_components.bticino_intercom.camera import BticinoSnapshotCamera
@@ -182,12 +182,32 @@ async def test_snapshot_stream_endpoint_returns_a_finite_image_response(
     camera = BticinoSnapshotCamera(coordinator)
     camera.hass = hass
 
-    response = await camera.handle_async_mjpeg_stream(MagicMock())
+    request = MagicMock()
+    request.headers = {"Accept": "image/webp,image/png,image/*;q=0.8,*/*;q=0.5"}
+    response = await camera.handle_async_mjpeg_stream(request)
 
     assert response is not None
     assert response.status == 200
     assert response.content_type == "image/jpeg"
     assert response.body == image
+
+
+async def test_snapshot_stream_endpoint_streams_for_non_image_clients(
+    hass: HomeAssistant,
+    coordinator: BticinoIntercomCoordinator,
+) -> None:
+    """A client that does not ask for an image (iOS notification preview) gets the MJPEG stream."""
+    camera = BticinoSnapshotCamera(coordinator)
+    camera.hass = hass
+    request = MagicMock()
+    request.headers = {"Accept": "*/*"}
+    stream = MagicMock()
+
+    with patch.object(Camera, "handle_async_mjpeg_stream", AsyncMock(return_value=stream)) as default:
+        response = await camera.handle_async_mjpeg_stream(request)
+
+    assert response is stream
+    default.assert_awaited_once_with(request)
 
 
 class TestEnableAudioSendrecv:

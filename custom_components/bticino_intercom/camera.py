@@ -271,8 +271,13 @@ class BticinoBaseEventCamera(CoordinatorEntity[BticinoIntercomCoordinator], Came
         turns a still image into a multipart stream that never finishes, which
         Safari may leave undecoded. A regular image response is valid for the
         frontend's ``img`` element and accurately represents this entity.
+
+        Clients that ask for a stream rather than an image (the iOS app's
+        notification preview, which accepts ``*/*``) still get the default
+        multipart stream: they cannot parse a plain JPEG response.
         """
-        del request
+        if "image/" not in request.headers.get("Accept", ""):
+            return await super().handle_async_mjpeg_stream(request)
         image = await self.async_camera_image()
         if image is None:
             return None
