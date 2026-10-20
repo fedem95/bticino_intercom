@@ -541,11 +541,11 @@ def _ringing_status_call(camera) -> dict:
     }
 
 
-async def test_busy_device_during_status_only_ring_ends_the_ring_and_retries(
+async def test_busy_device_during_status_only_ring_retries_when_the_ring_ends(
     hass: HomeAssistant,
     mock_setup_entry: MockConfigEntry,
 ) -> None:
-    """EOS: a live view refused while the unit rings ends the ring and offers again."""
+    """EOS: a live view refused while the unit rings is offered again once the ring ends."""
     from homeassistant.components.camera.webrtc import WebRTCError
 
     camera = _get_webrtc_camera(hass, mock_setup_entry)
@@ -554,46 +554,81 @@ async def test_busy_device_during_status_only_ring_ends_the_ring_and_retries(
     signaling.set_session_from_push = MagicMock()
 
     messages = []
-    with patch("custom_components.bticino_intercom.camera.RINGING_TAKEOVER_DELAY", 0):
+    with (
+        patch("custom_components.bticino_intercom.camera.RING_END_POLL", 0),
+        patch("custom_components.bticino_intercom.camera.RING_END_SETTLE", 0),
+    ):
         await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
         await signaling._on_event(
             "sess_busy", "terminate", {"data": {"error": {"message": "Max number of peers reached"}}}
         )
-        for _ in range(5):  # let the takeover task run, not the answer watchdog
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert signaling.send_offer.await_count == 1  # still ringing: waiting
+        camera.coordinator._active_call = None  # missed_call / accepted_call
+        for _ in range(10):
             await asyncio.sleep(0)
 
     assert not any(isinstance(m, WebRTCError) for m in messages), messages
-    signaling.set_session_from_push.assert_called_with(
-        session_id="ring-sess", tag_id="ring-tag", correlation_id="", device_id="00:03:50:00:00:01"
-    )
-    signaling.send_terminate.assert_awaited_once()
+    signaling.send_terminate.assert_not_awaited()
     assert signaling.send_offer.await_count == 2
     camera._cancel_answer_watchdog()
 
 
-async def test_busy_device_after_ring_takeover_reports_the_error(
+async def test_busy_device_while_ring_lasts_reports_ringing(
     hass: HomeAssistant,
     mock_setup_entry: MockConfigEntry,
 ) -> None:
-    """The ring is ended only once per view; a second refusal reaches the frontend."""
+    """If the ring outlasts the wait, the frontend gets an explicit 'ringing' error."""
     from homeassistant.components.camera.webrtc import WebRTCError
 
     camera = _get_webrtc_camera(hass, mock_setup_entry)
     camera.coordinator._active_call = _ringing_status_call(camera)
     signaling = _prep_offer_signaling(hass, mock_setup_entry, session_id="sess_busy")
     signaling.set_session_from_push = MagicMock()
-    busy = {"data": {"error": {"message": "Max number of peers reached"}}}
 
     messages = []
-    with patch("custom_components.bticino_intercom.camera.RINGING_TAKEOVER_DELAY", 0):
+    with (
+        patch("custom_components.bticino_intercom.camera.RING_END_POLL", 0),
+        patch("custom_components.bticino_intercom.camera.RING_END_WAIT", 0),
+    ):
         await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
-        await signaling._on_event("sess_busy", "terminate", busy)
-        for _ in range(5):  # let the takeover task run, not the answer watchdog
+        await signaling._on_event(
+            "sess_busy", "terminate", {"data": {"error": {"message": "Max number of peers reached"}}}
+        )
+        for _ in range(5):
             await asyncio.sleep(0)
-        await signaling._on_event("sess_busy", "terminate", busy)
 
-    assert any(isinstance(m, WebRTCError) for m in messages)
-    signaling.send_terminate.assert_awaited_once()
+    errors = [m for m in messages if isinstance(m, WebRTCError)]
+    assert errors and errors[0].code == "ringing"
+    assert signaling.send_offer.await_count == 1
+
+
+async def test_offer_server_error_reconnects_and_retries_once(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """An offer the server rejects ("Internal error") is sent again on a fresh connection."""
+    from homeassistant.components.camera.webrtc import WebRTCError
+    from pybticino.exceptions import PyBticinoException
+
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera.coordinator._active_call = None
+    signaling = _prep_offer_signaling(hass, mock_setup_entry, session_id="sess_ok")
+    signaling.send_offer = AsyncMock(side_effect=[PyBticinoException("Offer rejected: Internal error"), "sess_ok"])
+    signaling.disconnect = AsyncMock()
+    signaling.connect = AsyncMock()
+    _signaling_last_used[signaling] = asyncio.get_running_loop().time()
+
+    messages = []
+    await camera.async_handle_async_webrtc_offer(_OFFER_SDP, "ha_sess", messages.append)
+
+    assert not any(isinstance(m, WebRTCError) for m in messages), messages
+    assert signaling.send_offer.await_count == 2
+    signaling.disconnect.assert_awaited_once()
+    signaling.connect.assert_awaited_once()
+    assert camera._signaling_session_id == "sess_ok"
+    camera._cancel_answer_watchdog()
 
 
 async def test_busy_device_without_ring_reports_the_error(
