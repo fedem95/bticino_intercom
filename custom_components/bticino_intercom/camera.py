@@ -24,6 +24,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util.dt import utc_from_timestamp, utcnow
 from pybticino import AsyncAccount, SignalingClient
+from pybticino.exceptions import PyBticinoException
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
 from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
@@ -86,6 +87,17 @@ def _is_forwardable_candidate(candidate: str) -> bool:
 # After this much idle time, reopen the connection from scratch instead:
 # connect() waits for the server's subscribe "ok" before the offer goes out.
 SIGNALING_IDLE_RECONNECT = 300  # seconds
+
+# A Classe 300 EOS announces a ring with status pushes only: there is no device
+# offer to answer, so a live view opened while it rings is a new peer, and the
+# device refuses it until the ring ends. The ringing session cannot be ended from
+# here either: terminate needs the session's tag_id, which these pushes lack. So
+# wait for the ring to end and offer again, within the card's ~15 s budget.
+MAX_PEERS_ERROR = "Max number of peers reached"
+RING_END_WAIT = 10  # seconds to wait for a ring to end before giving up
+RING_END_POLL = 0.5
+RING_END_SETTLE = 1.5  # the device frees the slot shortly after missed/accepted
+RINGING_BUSY_MESSAGE = "The intercom is ringing: answer it from the BTicino app, or retry when the ring ends."
 _signaling_last_used: WeakKeyDictionary[SignalingClient, float] = WeakKeyDictionary()
 
 
@@ -888,13 +900,21 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                     )
                 )
 
+            waited_for_ring = False
+
             async def on_event(sig_session_id: str, event_type: str, data: dict) -> None:
+                nonlocal waited_for_ring
                 error = data.get("data", {}).get("error", {})
                 error_msg = error.get("message", event_type) if error else event_type
-                _LOGGER.warning("Signaling event %s: %s", event_type, error_msg)
                 _LOGGER.debug("Signaling event %s payload: %s", event_type, data)
                 # The device already dropped the session — no answer is coming.
                 self._cancel_answer_watchdog()
+                if error_msg == MAX_PEERS_ERROR and self._ringing_status_only_call() and not waited_for_ring:
+                    waited_for_ring = True
+                    _LOGGER.info("Device busy with a ringing call; opening the live view when the ring ends")
+                    self.hass.async_create_task(self._async_offer_after_ring(device_id, offer_sdp, send_message))
+                    return
+                _LOGGER.warning("Signaling event %s: %s", event_type, error_msg)
                 send_message(WebRTCError(code=event_type, message=error_msg))
 
             self._signaling._on_answer = on_answer
@@ -951,14 +971,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 # never fires, so without this self._signaling_session_id would stay
                 # None and close_webrtc_session would have no id to terminate, leaking
                 # the peer on the device until it times out (issue #58 / #60).
-                offer_session_id = await self._signaling.send_offer(
-                    device_id=device_id,
-                    sdp=offer_sdp,
-                    module_id=self._module_id,
-                )
-                if offer_session_id:
-                    self._signaling_session_id = offer_session_id
-                    self._arm_answer_watchdog(offer_session_id, send_message)
+                await self._async_send_offer(device_id, offer_sdp, send_message)
 
             # In answer mode, we're ready immediately (no on_answer callback expected).
             # In offer mode, on_answer handles this when the device responds.
@@ -969,6 +982,52 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
 
         except Exception as err:
             _LOGGER.exception("Failed to handle WebRTC offer")
+            send_message(WebRTCError(code="offer_failed", message=str(err)))
+
+    def _ringing_status_only_call(self) -> dict[str, Any] | None:
+        """Return the ringing status-only call on this camera's unit, if any."""
+        call = self.coordinator.active_call
+        if call and call.get("status_only") and call.get("session_id") and call.get("module_id") == self._module_id:
+            return call
+        return None
+
+    async def _async_send_offer(self, device_id: str, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
+        """Send the offer; on a server error reopen the connection and send it once more.
+
+        The signaling server sometimes answers an offer with "Internal error" and
+        drops the connection. A fresh connection takes the same offer.
+        """
+        try:
+            offer_session_id = await self._signaling.send_offer(
+                device_id=device_id, sdp=offer_sdp, module_id=self._module_id
+            )
+        except PyBticinoException as err:
+            _LOGGER.info("Offer failed (%s); reopening signaling and retrying once", err)
+            await self._signaling.disconnect()
+            await self._signaling.connect()
+            _signaling_last_used[self._signaling] = asyncio.get_running_loop().time()
+            offer_session_id = await self._signaling.send_offer(
+                device_id=device_id, sdp=offer_sdp, module_id=self._module_id
+            )
+        if offer_session_id:
+            self._signaling_session_id = offer_session_id
+            self._arm_answer_watchdog(offer_session_id, send_message)
+
+    async def _async_offer_after_ring(self, device_id: str, offer_sdp: str, send_message: WebRTCSendMessage) -> None:
+        """Wait for a status-only ring to end, then send the live view offer again."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + RING_END_WAIT
+        while self._ringing_status_only_call() and loop.time() < deadline:
+            await asyncio.sleep(RING_END_POLL)
+        if self._ringing_status_only_call():
+            _LOGGER.info("Ring still in progress; live view not opened")
+            send_message(WebRTCError(code="ringing", message=RINGING_BUSY_MESSAGE))
+            return
+        await asyncio.sleep(RING_END_SETTLE)
+        try:
+            await self._async_send_offer(device_id, offer_sdp, send_message)
+        except Exception as err:
+            _LOGGER.warning("Could not open the live view after the ring: %s", err)
             send_message(WebRTCError(code="offer_failed", message=str(err)))
 
     async def _release_stale_session(self) -> None:
