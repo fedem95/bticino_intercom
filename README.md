@@ -332,6 +332,21 @@ intercoms:
 > [!NOTE]
 > The browser limitation is caused by the BTicino device firmware (BNC1), which hardcodes Chrome/libwebrtc RTP payload type numbers in its media engine regardless of SDP negotiation. This cannot be fixed from the integration side. The official Netatmo app works on iOS because it bundles the same `libwebrtc` engine as Chrome, not because it does any special handling.
 
+### Classe 300 EOS: answering calls (experimental)
+
+A Classe 300 EOS (bridge `BNCX`) sends its call offer only to push tokens registered as the Netatmo Android app through Firebase Cloud Messaging, never on the WebSocket the integration listens to. Without that offer Home Assistant sees the ring but cannot answer it.
+
+The integration can register such a token itself, but it needs the app's Firebase identity, which is **not** shipped with the integration. Each user extracts it from the Netatmo **Home + Security** APK (`com.netatmo.camera`):
+
+```bash
+pip install "pybticino[fcm]"
+python -m pybticino.fcm com.netatmo.camera.apk bticino_intercom_fcm.json
+```
+
+Copy `bticino_intercom_fcm.json` to the Home Assistant config directory (next to `configuration.yaml`) and reload the integration. Keep the file private and never commit it. The log then shows `Receiving call offers through FCM`; without the file the integration behaves as before.
+
+While the intercom rings, opening the intercom's camera answers the call: the other phones get "someone answered" and stop ringing. Merely receiving the offer does not answer anything. Unloading the integration removes the push token from the account.
+
 ### Reporting issues
 
 When reporting a v2.0 bug:
