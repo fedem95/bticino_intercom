@@ -123,49 +123,120 @@ async def test_call_home_exists_on_voice_only_intercom(
     assert hass.states.get(entity_id) is not None
 
 
+# A Classe 300 EOS offer (GStreamer webrtcbin): video first, mids video0/audio1.
+_DEVICE_OFFER_SDP = (
+    "v=0\r\no=- 2577976111419017810 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\n"
+    "a=ice-options:trickle\r\na=group:BUNDLE video0 audio1\r\n"
+    "m=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=setup:actpass\r\n"
+    "a=ice-ufrag:devu\r\na=ice-pwd:devpassword\r\na=rtcp-mux\r\na=rtcp-rsize\r\na=sendonly\r\n"
+    "a=rtpmap:96 H264/90000\r\na=rtcp-fb:96 nack pli\r\na=fmtp:96 packetization-mode=1\r\n"
+    "a=ssrc:2256356439 cname:dev\r\na=mid:video0\r\na=fingerprint:sha-256 AA:BB\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=setup:actpass\r\n"
+    "a=ice-ufrag:devu\r\na=ice-pwd:devpassword\r\na=rtcp-mux\r\na=rtcp-rsize\r\na=sendrecv\r\n"
+    "a=rtpmap:111 OPUS/48000/2\r\na=ssrc:2445106994 cname:dev\r\na=mid:audio1\r\na=fingerprint:sha-256 AA:BB\r\n"
+)
+
+# The card's offer: audio first (sendrecv, mic or silence), video recvonly; Chrome numbering.
+_CARD_OFFER_SDP = (
+    "v=0\r\no=- 8318511266467511362 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n"
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:brwu\r\na=ice-pwd:browserpassword\r\n"
+    "a=ice-options:trickle\r\na=fingerprint:sha-256 CC:DD\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\n"
+    "a=msid:s1 t1\r\na=rtcp-mux\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n"
+    "a=rtpmap:0 PCMU/8000\r\na=ssrc:449166653 cname:brw\r\n"
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 102 103\r\nc=IN IP4 0.0.0.0\r\na=ice-ufrag:brwu\r\n"
+    "a=ice-pwd:browserpassword\r\na=fingerprint:sha-256 CC:DD\r\na=setup:actpass\r\na=mid:1\r\na=recvonly\r\n"
+    "a=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 rtx/90000\r\na=fmtp:97 apt=96\r\n"
+    "a=rtpmap:102 H264/90000\r\na=rtcp-fb:102 nack pli\r\n"
+    "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f\r\n"
+    "a=rtpmap:103 rtx/90000\r\na=fmtp:103 apt=102\r\n"
+)
+
+
+def _sections(sdp: str) -> list[list[str]]:
+    sections: list[list[str]] = []
+    for line in sdp.split("\r\n"):
+        if line.startswith("m="):
+            sections.append([line])
+        elif sections and line:
+            sections[-1].append(line)
+    return sections
+
+
 async def test_answer_mode_when_active_call(
     hass: HomeAssistant,
     mock_setup_entry: MockConfigEntry,
 ) -> None:
-    """When an active call with SDP exists, send_answer is called (not send_offer)."""
+    """On an incoming call both sides get a real answer to their own offer."""
     camera = _get_webrtc_camera(hass, mock_setup_entry)
 
-    # Set up an active call on the coordinator
     camera.coordinator._active_call = {
         "session_id": "sess_incoming",
         "tag_id": "tag123",
         "device_id": "00:03:50:d9:a6:3b",
         "module_id": "d9a63b-a06f-2ef633a2f733",
-        "sdp": "v=0\r\no=- 1 0 IN IP4 0.0.0.0\r\na=setup:actpass\r\n",
+        "sdp": _DEVICE_OFFER_SDP,
     }
 
-    # Mock signaling
     signaling = hass.data[DOMAIN][mock_setup_entry.entry_id]["signaling_client"]
     signaling.send_answer = AsyncMock()
     signaling.send_offer = AsyncMock(return_value="sess_new")
     signaling._is_connected = True
     signaling.is_connected = True
 
-    offer_sdp = "v=0\r\no=- 9 0 IN IP4 0.0.0.0\r\na=setup:actpass\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
-
     messages = []
-    await camera.async_handle_async_webrtc_offer(offer_sdp, "test_session", messages.append)
+    await camera.async_handle_async_webrtc_offer(_CARD_OFFER_SDP, "test_session", messages.append)
 
-    # send_answer should have been called, not send_offer
     signaling.send_answer.assert_called_once()
     signaling.send_offer.assert_not_called()
 
-    # The SDP passed to send_answer should have actpass converted to active
-    answer_sdp = signaling.send_answer.call_args[0][0]
-    assert "a=setup:active" in answer_sdp
-    assert "a=setup:actpass" not in answer_sdp
+    # The device's answer follows the device's offer: video0 then audio1, its
+    # own payload types, the browser's transport, and the browser as DTLS client.
+    video, audio = _sections(signaling.send_answer.call_args[0][0])
+    assert video[0] == "m=video 9 UDP/TLS/RTP/SAVPF 96"
+    assert "a=mid:video0" in video
+    assert "a=recvonly" in video
+    assert audio[0] == "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+    assert "a=mid:audio1" in audio
+    assert "a=sendrecv" in audio
+    assert "a=ssrc:449166653 cname:brw" in audio
+    for section in (video, audio):
+        assert "a=setup:active" in section
+        assert "a=ice-ufrag:brwu" in section
 
-    # Verify WebRTCAnswer was sent to browser with device's SDP
+    # The browser's answer follows the browser's offer: mids 0 and 1, Chrome's
+    # H264 number, the device's transport, the device as DTLS server.
     from homeassistant.components.camera.webrtc import WebRTCAnswer
 
     answer_messages = [m for m in messages if isinstance(m, WebRTCAnswer)]
     assert len(answer_messages) == 1
-    assert answer_messages[0].answer == "v=0\r\no=- 1 0 IN IP4 0.0.0.0\r\na=setup:actpass\r\n"
+    browser_answer = answer_messages[0].answer
+    assert "a=group:BUNDLE 0 1" in browser_answer
+    audio, video = _sections(browser_answer)
+    assert audio[0] == "m=audio 9 UDP/TLS/RTP/SAVPF 111"
+    assert "a=mid:0" in audio
+    assert "a=sendrecv" in audio
+    assert video[0] == "m=video 9 UDP/TLS/RTP/SAVPF 102"
+    assert "a=mid:1" in video
+    assert "a=sendonly" in video
+    for section in (audio, video):
+        assert "a=setup:passive" in section
+        assert "a=ice-ufrag:devu" in section
+
+
+def test_answer_rejects_media_the_answerer_lacks() -> None:
+    """A browser video section with no device video is answered as rejected, outside BUNDLE."""
+    from custom_components.bticino_intercom.camera import BticinoWebRTCCamera
+
+    audio_only_device = (
+        _DEVICE_OFFER_SDP[: _DEVICE_OFFER_SDP.index("m=video")]
+        + _DEVICE_OFFER_SDP[_DEVICE_OFFER_SDP.index("m=audio") :]
+    )
+    answer = BticinoWebRTCCamera.answer_for_browser(_CARD_OFFER_SDP, audio_only_device)
+    audio, video = _sections(answer)
+    assert "a=mid:0" in audio
+    assert video[0].split()[1] == "0"
+    assert "a=mid:1" in video
+    assert "a=group:BUNDLE 0\r\n" in answer
 
 
 async def test_answer_mode_only_for_matching_module(
