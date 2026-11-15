@@ -13,6 +13,24 @@ from custom_components.bticino_intercom.const import DOMAIN
 from custom_components.bticino_intercom.coordinator import BticinoIntercomCoordinator
 
 
+def test_incoming_call_attribute_tells_a_late_card_the_unit_rings() -> None:
+    """incoming_call is on while this unit rings and nobody has taken the call."""
+    from custom_components.bticino_intercom.camera import BticinoWebRTCCamera
+
+    coordinator = MagicMock()
+    coordinator.entry.entry_id = "entry1"
+    coordinator.active_call = None
+    camera = BticinoWebRTCCamera(coordinator, MagicMock(), MagicMock(), module_id="unit1", module_name="Door")
+
+    assert camera.extra_state_attributes == {"incoming_call": False}
+    coordinator.active_call = {"module_id": "unit1", "session_id": "s1"}
+    assert camera.extra_state_attributes == {"incoming_call": True, "incoming_call_session": "s1"}
+    coordinator.active_call = {"module_id": "unit2", "session_id": "s1"}
+    assert camera.extra_state_attributes == {"incoming_call": False}
+    coordinator.active_call = {"module_id": "unit1", "session_id": "s1", "accepted": True}
+    assert camera.extra_state_attributes == {"incoming_call": False}
+
+
 class TestExtractImageFromEvent:
     """Test _extract_image_from_event for both WS and API event formats."""
 

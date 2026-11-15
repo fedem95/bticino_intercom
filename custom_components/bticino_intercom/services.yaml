@@ -1,3 +1,45 @@
+answer_call:
+  name: Answer Call
+  description: >-
+    Answer the ringing call from Home Assistant. Home Assistant joins the call as
+    a real peer, so the call counts as answered and stops ringing on the indoor
+    monitor and on the other devices. Classe 300 EOS only, with the FCM offer set up.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The config entry to answer the call for. Defaults to the first entry.
+      required: false
+      selector:
+        text:
+    max_duration:
+      name: Maximum duration
+      description: Seconds after which the answered call is hung up.
+      required: false
+      default: 120
+      selector:
+        number:
+          min: 10
+          max: 600
+          unit_of_measurement: s
+    from_view:
+      name: From a view
+      description: >-
+        Called by a card whose stream just connected: take the ring only if
+        that view answered it (the app's green handset), otherwise do nothing.
+      required: false
+      default: false
+      selector:
+        boolean:
+hangup_call:
+  name: Hang Up Call
+  description: Hang up the call answered from Home Assistant.
+  fields:
+    entry_id:
+      name: Config Entry ID
+      description: The config entry whose call to hang up. Defaults to the first entry.
+      required: false
+      selector:
+        text:
 reject_call:
   name: Reject Call
   description: Reject the active incoming call, terminating it for all devices.

@@ -7,6 +7,7 @@ DOMAIN = "bticino_intercom"
 PLATFORMS: list[Platform] = [
     Platform.LOCK,
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.SENSOR,
     Platform.LIGHT,
     Platform.CAMERA,
@@ -47,6 +48,12 @@ PUSH_TYPE_RTC = "rtc"  # Base type for RTC events
 
 # Dispatcher signal
 SIGNAL_CALL_RECEIVED = f"{DOMAIN}_call_received"
+
+# Bridges whose calls Home Assistant answers itself (call_answerer.py): the
+# two-step answer (SDP answer, then the app's "player unmute") was traced and
+# verified on a Classe 300 EOS only. Other bridges keep the camera's answer
+# mode as before, without the unmute.
+ANSWER_BRIDGE_TYPES = ("BNCX",)
 
 # Logbook Event Types
 EVENT_LOGBOOK_INCOMING_CALL = f"{DOMAIN}_incoming_call"

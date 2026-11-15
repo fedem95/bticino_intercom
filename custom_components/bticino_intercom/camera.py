@@ -28,6 +28,7 @@ from pybticino import AsyncAccount, SignalingClient
 from pybticino.exceptions import PyBticinoException
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
+from .call_answerer import async_bridge_ended, async_bridge_started, current_answerer
 from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
 from .coordinator import BticinoIntercomCoordinator
 from .utils import cleanup_orphaned_entities, format_timestamp_iso, get_module_subtype
@@ -78,6 +79,15 @@ def _candidate_type(candidate: str) -> str:
     if "typ" in parts and parts.index("typ") + 1 < len(parts):
         return parts[parts.index("typ") + 1]
     return "unknown"
+
+
+_SDP_DIGEST_PREFIXES = ("m=", "a=mid:", "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive", "a=setup:")
+_SDP_DIGEST_PREFIXES += ("a=rtpmap:", "a=fmtp:", "a=ssrc:", "a=msid:", "a=group:", "a=extmap:")
+
+
+def _sdp_digest(sdp: str) -> str:
+    """The SDP lines that decide what media flows, without keys or addresses."""
+    return "\n".join(line for line in sdp.splitlines() if line.startswith(_SDP_DIGEST_PREFIXES))
 
 
 def _is_forwardable_candidate(candidate: str) -> bool:
@@ -135,6 +145,7 @@ RING_END_WAIT = 10  # seconds to wait for a ring to end before giving up
 RING_END_POLL = 0.5
 RING_END_SETTLE = 1.5  # the device frees the slot shortly after missed/accepted
 RINGING_BUSY_MESSAGE = "The intercom is ringing: answer it from the BTicino app, or retry when the ring ends."
+ANSWERED_IN_HA_MESSAGE = "Home Assistant is on a call with the intercom: hang up first."
 _signaling_last_used: WeakKeyDictionary[SignalingClient, float] = WeakKeyDictionary()
 
 
@@ -449,6 +460,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.STREAM
     _attr_entity_registry_enabled_default = True
+    _unrecorded_attributes = frozenset({"incoming_call_session"})
 
     # Seconds to wait for the device's answer; None means ANSWER_TIMEOUT_SECONDS.
     _answer_timeout: float | None = None
@@ -499,6 +511,20 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
     def available(self) -> bool:
         """Return True if the coordinator has data and bridge is known."""
         return self.coordinator.last_update_success and self.coordinator.main_device_id is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Whether this unit is ringing now, nobody having taken the call yet.
+
+        A card opened after the ring event missed it; this lets it show the
+        ring anyway (and the session, so it shows each ring once).
+        """
+        call = self.coordinator.active_call
+        ringing = bool(call and call.get("module_id") == self._module_id and not call.get("accepted"))
+        attributes: dict[str, Any] = {"incoming_call": ringing}
+        if ringing:
+            attributes["incoming_call_session"] = call.get("session_id")
+        return attributes
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         """Return a "press play" card for the live view.
@@ -1017,6 +1043,12 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
             send_message(WebRTCError(code="no_device", message="No bridge device found"))
             return
 
+        # Home Assistant is itself on a call with the device: it owns the
+        # signaling callbacks and the device has no peer slot for a live view.
+        if current_answerer(self.hass, self.coordinator.entry.entry_id):
+            send_message(WebRTCError(code="answered_in_ha", message=ANSWERED_IN_HA_MESSAGE))
+            return
+
         self._session_ready = False
         self._pending_candidates.clear()
         # Keep the browser's own offer: the answer we hand back has to line up
@@ -1109,8 +1141,23 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 # Both sides offered: each gets a real answer to its own offer,
                 # built from the other side's media and transport.
                 device_offer_sdp = active_call["sdp"]
-                await self._signaling.send_answer(self.answer_for_device(device_offer_sdp, browser_offer_sdp))
-                send_message(WebRTCAnswer(answer=self.answer_for_browser(browser_offer_sdp, device_offer_sdp)))
+                device_answer = self.answer_for_device(device_offer_sdp, browser_offer_sdp)
+                browser_answer = self.answer_for_browser(browser_offer_sdp, device_offer_sdp)
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    # The SDPs say which codecs and directions each side got:
+                    # what to read when audio or video does not flow.
+                    for label, sdp in (
+                        ("device offer", device_offer_sdp),
+                        ("browser offer", browser_offer_sdp),
+                        ("answer to device", device_answer),
+                        ("answer to browser", browser_answer),
+                    ):
+                        _LOGGER.debug("Answer mode %s:\n%s", label, _sdp_digest(sdp))
+                await self._signaling.send_answer(device_answer)
+                send_message(WebRTCAnswer(answer=browser_answer))
+                # This is the app's preview: the indoor monitor keeps ringing
+                # until answer_call sends the green handset's unmute.
+                async_bridge_started(self.hass, self.coordinator.entry.entry_id, active_call)
             else:
                 # --- Offer mode: initiate on-demand call ---
                 _LOGGER.info("Sending WebRTC offer to device %s (module=%s)", device_id, self._module_id)
@@ -1323,6 +1370,10 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         # signaling client's current session id so we still terminate when the
         # offer was acked but never answered (issue #58 / #60).
         signaling_session_id = self._signaling_session_id or self._signaling.session_id
+        answerer = current_answerer(self.hass, self.coordinator.entry.entry_id)
+        if answerer and signaling_session_id == answerer.session_id:
+            # That session is the call answered from Home Assistant, not this view's.
+            signaling_session_id = None
         _LOGGER.info(
             "Closing WebRTC session for %s (signaling_session=%s)",
             self._module_id,
@@ -1332,6 +1383,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         self._session_ready = False
         self._pending_candidates.clear()
         self._signaling_session_id = None
+        async_bridge_ended(self.hass, self.coordinator.entry.entry_id, signaling_session_id)
         if signaling_session_id:
             # Point the shared signaling client at this camera's session so
             # send_terminate uses the correct session_id.  HA runs on a
