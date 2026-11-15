@@ -13,6 +13,9 @@ bticino_intercom.egg-info/
 .credentials
 .local/
 ha-dev-config/
+# Netatmo app's Firebase identity, written by each user: never commit it
+bticino_intercom_fcm.json
+*.apk
 .superpowers/
 .claude/
 dist/

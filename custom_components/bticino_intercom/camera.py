@@ -542,7 +542,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
     # - _filter_video_codecs():        browser offer → device (H264 only; size limit)
     # - _fix_answer_audio_direction(): device answer → browser (sendrecv → sendonly)
     # - _align_answer_with_offer():    device answer → browser (restore missing m-sections)
-    # - convert_offer_to_answer_sdp(): DTLS role for answer mode (actpass → active)
+    # - answer_for_device() / answer_for_browser(): answer mode (see below)
     #
     # Two more rewrites, each with its own consequence:
     #
@@ -726,47 +726,6 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         return "\r\n".join(result)
 
     @staticmethod
-    def _reorder_mlines(answer_sdp: str, offer_sdp: str) -> str:
-        """Reorder m-lines in the answer to match the offer's order.
-
-        RFC 8829 requires the answer's m-lines to appear in the same order
-        as the offer's. The device SDP may have (video, audio) while the
-        browser offer has (audio, video) — or vice versa.
-        """
-
-        def _extract_mline_order(sdp: str) -> list[str]:
-            return [line.split()[0].split("=")[1] for line in sdp.split("\r\n") if line.startswith("m=")]
-
-        offer_order = _extract_mline_order(offer_sdp)
-        answer_order = _extract_mline_order(answer_sdp)
-
-        if offer_order == answer_order:
-            return answer_sdp
-
-        # Split answer SDP into session-level lines and m-sections
-        lines = answer_sdp.split("\r\n")
-        session_lines: list[str] = []
-        sections: dict[str, list[str]] = {}
-        current_type: str | None = None
-
-        for line in lines:
-            if line.startswith("m="):
-                current_type = line.split()[0].split("=")[1]
-                sections.setdefault(current_type, []).append(line)
-            elif current_type is None:
-                session_lines.append(line)
-            else:
-                sections[current_type].append(line)
-
-        # Rebuild in offer's order
-        result = list(session_lines)
-        for mtype in offer_order:
-            if mtype in sections:
-                result.extend(sections[mtype])
-
-        return "\r\n".join(result)
-
-    @staticmethod
     def _split_sdp_sections(sdp: str) -> tuple[list[str], list[list[str]]]:
         """Split an SDP into its session-level lines and its m-sections."""
         session: list[str] = []
@@ -842,15 +801,165 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         lines.append("")  # final CRLF
         return "\r\n".join(lines)
 
-    @staticmethod
-    def convert_offer_to_answer_sdp(offer_sdp: str) -> str:
-        """Convert a browser SDP offer to be usable as an answer to the device.
+    # --- Answer mode: two real answers instead of swapped offers ---
+    #
+    # On an incoming call both sides have made an offer: the device (in the
+    # push) and the browser (through HA). Each must get an answer that matches
+    # its own offer section for section: same order, same mids, a definite DTLS
+    # role (the browser takes "active", the device stays "passive"), and a
+    # direction the offer allows. The Classe 300 EOS (GStreamer webrtcbin)
+    # offers video first with mids "video0"/"audio1"; the card offers audio
+    # first with mids "0"/"1", so Chrome refuses the device offer as an answer.
+    #
+    # Payload types: each answer keeps the numbers of the offer it answers, so
+    # every side receives on the numbers it announced. Codecs are matched by
+    # name (and H264 packetization-mode).
 
-        Used in answer mode (incoming call): the browser's offer is sent to
-        the device as an "answer" to the device's original call offer.
-        The DTLS setup role must change from actpass (offerer) to active (answerer).
+    _DIRECTIONS = ("sendrecv", "sendonly", "recvonly", "inactive")
+    _TRANSPORT_PREFIXES = ("a=ice-ufrag:", "a=ice-pwd:", "a=fingerprint:")
+
+    @classmethod
+    def _section_direction(cls, section: list[str]) -> str:
+        return next((line[2:] for line in section if line[2:] in cls._DIRECTIONS), "sendrecv")
+
+    @staticmethod
+    def _answer_direction(offered: str, wanted: str) -> str:
+        """Direction an answerer may take: what it wants, within what the offer allows."""
+        send = offered in ("sendrecv", "recvonly") and wanted in ("sendrecv", "sendonly")
+        recv = offered in ("sendrecv", "sendonly") and wanted in ("sendrecv", "recvonly")
+        return {(True, True): "sendrecv", (True, False): "sendonly", (False, True): "recvonly"}.get(
+            (send, recv), "inactive"
+        )
+
+    @classmethod
+    def _transport_lines(cls, session: list[str], section: list[str]) -> list[str]:
+        """ICE credentials and DTLS fingerprint, from the section or else the session."""
+        lines = []
+        for prefix in cls._TRANSPORT_PREFIXES:
+            line = next((x for x in section if x.startswith(prefix)), None) or next(
+                (x for x in session if x.startswith(prefix)), None
+            )
+            if line:
+                lines.append(line)
+        return lines
+
+    @staticmethod
+    def _codecs(section: list[str]) -> list[tuple[str, str, str]]:
+        """(payload type, codec name, fmtp) for each codec, in m-line order."""
+        rtpmaps = {}
+        fmtps = {}
+        for line in section:
+            if match := re.match(r"a=rtpmap:(\d+) ([^/\s]+)/", line):
+                rtpmaps[match.group(1)] = match.group(2).upper()
+            elif match := re.match(r"a=fmtp:(\d+) (.*)", line):
+                fmtps[match.group(1)] = match.group(2)
+        return [(pt, rtpmaps[pt], fmtps.get(pt, "")) for pt in section[0].split()[3:] if pt in rtpmaps]
+
+    @staticmethod
+    def _codec_key(name: str, fmtp: str) -> tuple[str, str]:
+        if name == "H264":
+            match = re.search(r"packetization-mode=(\d)", fmtp)
+            return name, match.group(1) if match else "0"
+        return name, ""
+
+    @classmethod
+    def _answer_section(
+        cls,
+        offer: list[str],
+        source: list[str],
+        source_session: list[str],
+        setup: str,
+        wanted_direction: str,
+    ) -> list[str] | None:
+        """Answer one offered m-section with the answerer's own section `source`.
+
+        Keeps the offer's payload types and mid, and the answerer's transport
+        and media sources. Returns None when no codec is shared.
         """
-        return offer_sdp.replace("a=setup:actpass", "a=setup:active")
+        offered: dict[tuple[str, str], str] = {}
+        for pt, name, fmtp in cls._codecs(offer):
+            offered.setdefault(cls._codec_key(name, fmtp), pt)  # the offer's preferred number
+        pts = []
+        for _pt, name, fmtp in cls._codecs(source):
+            pt = offered.get(cls._codec_key(name, fmtp))
+            if pt and pt not in pts and name not in ("RTX", "RED", "ULPFEC", "FLEXFEC-03"):
+                pts.append(pt)
+        if not pts:
+            return None
+
+        header = offer[0].split()
+        mid = next((line for line in offer if line.startswith("a=mid:")), None)
+        direction = cls._answer_direction(cls._section_direction(offer), wanted_direction)
+        section = [" ".join([header[0], "9", header[2], *pts]), "c=IN IP4 0.0.0.0"]
+        if mid:
+            section.append(mid)
+        section.append(f"a=setup:{setup}")
+        section.extend(cls._transport_lines(source_session, source))
+        section.extend(["a=rtcp-mux", "a=rtcp-rsize", f"a={direction}"])
+        # The offer's own codec lines for the chosen payload types.
+        section.extend(
+            line for line in offer if (m := re.match(r"a=(?:rtpmap|fmtp|rtcp-fb):(\d+)\b", line)) and m.group(1) in pts
+        )
+        if direction in ("sendrecv", "sendonly"):
+            section.extend(line for line in source if line.startswith(("a=ssrc:", "a=msid:")))
+        return section
+
+    @classmethod
+    def _build_answer(cls, offer_sdp: str, answerer_sdp: str, setup: str) -> str:
+        """Answer `offer_sdp` using the media and transport of the answerer's own offer.
+
+        Every offered section is answered in order; one the answerer has no
+        matching media for is rejected (port 0). Accepted sections are bundled,
+        as both peers bundle.
+        """
+        offer_session, offer_sections = cls._split_sdp_sections(offer_sdp)
+        source_session, source_sections = cls._split_sdp_sections(answerer_sdp)
+
+        remaining = list(source_sections)
+        answer_sections: list[list[str]] = []
+        accepted_mids: list[str] = []
+        for offer in offer_sections:
+            media = cls._section_key(offer)[0]
+            source = next((s for s in remaining if cls._section_key(s)[0] == media), None)
+            section = None
+            if source is not None and offer[0].split()[1] != "0":
+                remaining.remove(source)
+                section = cls._answer_section(
+                    offer, source, source_session, setup, wanted_direction=cls._section_direction(source)
+                )
+            if section is None:
+                header = offer[0].split()
+                section = [" ".join([header[0], "0", *header[2:]]), "c=IN IP4 0.0.0.0", "a=inactive"]
+                section.extend(line for line in offer if line.startswith("a=mid:"))
+                _LOGGER.debug("Answer rejects the offered %s section", media)
+            elif mid := cls._section_key(offer)[1]:
+                accepted_mids.append(mid)
+            answer_sections.append(section)
+
+        origin = next((line for line in source_session if line.startswith("o=")), "o=- 0 0 IN IP4 0.0.0.0")
+        lines = ["v=0", origin, "s=-", "t=0 0"]
+        if accepted_mids:
+            lines.append("a=group:BUNDLE " + " ".join(accepted_mids))
+        if any("a=ice-options:trickle" in line for line in offer_session + source_session):
+            lines.append("a=ice-options:trickle")
+        for section in answer_sections:
+            lines.extend(section)
+        lines.append("")  # final CRLF
+        return "\r\n".join(lines)
+
+    @classmethod
+    def answer_for_device(cls, device_offer_sdp: str, browser_offer_sdp: str) -> str:
+        """The answer the device gets: its own offer answered with the browser's media.
+
+        The browser takes the DTLS client role, so its offer's actpass becomes
+        "active" and the device stays the DTLS server, as with the official app.
+        """
+        return cls._build_answer(device_offer_sdp, browser_offer_sdp, setup="active")
+
+    @classmethod
+    def answer_for_browser(cls, browser_offer_sdp: str, device_offer_sdp: str) -> str:
+        """The answer the browser gets: its offer answered with the device's media (DTLS passive)."""
+        return cls._build_answer(browser_offer_sdp, device_offer_sdp, setup="passive")
 
     async def _flush_pending_candidates(self) -> None:
         """Send all buffered ICE candidates now that the session is ready."""
@@ -997,16 +1106,11 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                     active_call.get("session_id"),
                     device_id,
                 )
-                answer_sdp = self.convert_offer_to_answer_sdp(offer_sdp)
-                await self._signaling.send_answer(answer_sdp)
-
-                # Send the device's original offer to the browser as the "answer".
-                # The browser needs a remote SDP to complete the WebRTC handshake.
-                # The device's offer serves this role — it contains the device's
-                # media capabilities, ICE credentials, and DTLS fingerprint.
-                # Reorder m-lines to match the browser's offer (RFC 8829).
-                device_sdp = self._reorder_mlines(active_call["sdp"], offer_sdp)
-                send_message(WebRTCAnswer(answer=device_sdp))
+                # Both sides offered: each gets a real answer to its own offer,
+                # built from the other side's media and transport.
+                device_offer_sdp = active_call["sdp"]
+                await self._signaling.send_answer(self.answer_for_device(device_offer_sdp, browser_offer_sdp))
+                send_message(WebRTCAnswer(answer=self.answer_for_browser(browser_offer_sdp, device_offer_sdp)))
             else:
                 # --- Offer mode: initiate on-demand call ---
                 _LOGGER.info("Sending WebRTC offer to device %s (module=%s)", device_id, self._module_id)
