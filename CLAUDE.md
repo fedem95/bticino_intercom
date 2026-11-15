@@ -25,6 +25,8 @@ All code is in `custom_components/bticino_intercom/`.
 - `camera.py`: one WebRTC camera per external unit (`BNEU`), plus Call Home, which sends the same offer to the bridge's own module id and rings the indoor monitor. Offer mode for live view, answer mode for an incoming call's offer.
 - Entities: `lock` (`BNDL`), call `binary_sensor` and doorbell `event` (`BNEU`), `light` (`BNSL`/`BNVL`), `sensor`, and `select`/`switch`/`number` for `BNC3` settings. Entities carry a `module_id` attribute; the camera and doorbell of one unit share it, and cards pair them on it.
 - `history.py` and `media_source.py` keep the call history on disk; `websocket_api.py` serves it to cards as `bticino_intercom/history`.
+- `fcm_push.py` receives the Classe 300 EOS call offers through FCM, with the user's local `bticino_intercom_fcm.json` (the Netatmo app's Firebase identity: never commit it or put it in code).
+- `call_answerer.py` answers Classe 300 EOS (`ANSWER_BRIDGE_TYPES`) calls: services `answer_call`/`hangup_call` and the Answer call / Hang up call buttons. With no view open, Home Assistant is the media peer (aiortc; the answer is prepared when the offer arrives, nothing is sent until `answer_call`). When a card's view has answered the ring (the camera's answer mode, `async_bridge_started`), `answer_call` with `from_view` only sends the unmute on that session.
 
 ## Device facts
 
@@ -39,6 +41,7 @@ What the config and the code don't tell you:
 - HA 2026.11 native two-way audio: the talk button closes the stream and sends a new offer with the mic track, so closing a session must free its peer slot before the next offer goes out.
 - How the device microphone is switched on is unsettled: pybticino `docs/webrtc-audio.md` and `camera.py` disagree (pybticino#31, step 4).
 - EasyKit `BDIY`: an incoming call's offer arrives only as an FCM push, and the call becomes accepted after one `{"type":"player","value":"unmute"}` sent once the peer connection is `connected`. `unmute` toggles, so a second one mutes the call. Work in progress in #72.
+- Classe 300 EOS `BNCX` (traced from the Android app 4.1.1.3): the offer arrives only through FCM. An SDP answer to it is only the preview: the cloud tells the other phones someone answered, but the indoor monitor keeps ringing and the call ends as missed after ~27 s. One `player`/`unmute` on the call's session takes it: the device stops ringing and reports `accepted_call`. The EOS offers video first (mids `video0`/`audio1`), so each side gets a real answer to its own offer (`answer_for_device`/`answer_for_browser`) instead of the other side's offer. aiortc needs a wider DTLS cipher list for the device's RSA certificate.
 
 ## Workflow
 
