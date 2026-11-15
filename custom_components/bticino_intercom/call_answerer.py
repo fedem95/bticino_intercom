@@ -27,11 +27,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN
 
@@ -44,6 +46,7 @@ _LOGGER = logging.getLogger(__name__)
 CONNECT_TIMEOUT = 20  # seconds from our answer to a connected media session
 DEFAULT_MAX_DURATION = 120  # seconds an answered call stays open at most
 ANSWER_SETTLE = 0.5  # seconds between our answer and our first candidate
+PREPARED_TTL = 60  # seconds a prepared, unused answer is kept (a ring lasts ~27 s)
 
 # ECDHE-RSA and plain RSA suites as a browser offers them, ECDSA first so a
 # peer with an ECDSA certificate negotiates as before.
@@ -152,10 +155,13 @@ async def async_answer_call(hass: HomeAssistant, entry_id: str, max_duration: fl
             "The call offer has not reached Home Assistant (for a Classe 300 EOS it comes through FCM)"
         )
 
-    answerer = EosCallAnswerer(
-        hass, entry_data["account"], entry_data["signaling_client"], call, max_duration=max_duration
-    )
-    entry_data[ANSWERER_KEY] = answerer
+    answerer = entry_data.get(ANSWERER_KEY)
+    if answerer is None or answerer.session_id != str(call["session_id"]) or answerer.state != "idle":
+        if answerer is not None:
+            await answerer.async_discard()
+        answerer = EosCallAnswerer(hass, entry_data["account"], entry_data["signaling_client"], call)
+        entry_data[ANSWERER_KEY] = answerer
+    answerer.max_duration = max_duration
     _LOGGER.info("Answering call %s from Home Assistant", answerer.session_id)
     try:
         await answerer.async_answer()
@@ -167,6 +173,46 @@ async def async_hangup_call(hass: HomeAssistant, entry_id: str) -> None:
     """Hang up the call answered from Home Assistant, if there is one."""
     if answerer := current_answerer(hass, entry_id):
         await answerer.async_hangup()
+
+
+async def async_release_call(hass: HomeAssistant, entry_id: str) -> None:
+    """On unload: hang up a call answered here and drop a prepared answer."""
+    await async_hangup_call(hass, entry_id)
+    if answerer := hass.data.get(DOMAIN, {}).get(entry_id, {}).get(ANSWERER_KEY):
+        await answerer.async_discard()
+
+
+@callback
+def async_prepare_call(hass: HomeAssistant, entry_id: str) -> None:
+    """Get the ringing call's answer ready, so answering takes about a second.
+
+    Called when a device offer arrives. Sends nothing: the call stays ringing
+    until async_answer_call. An unused preparation is dropped after
+    PREPARED_TTL seconds, or when the next call comes in.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if entry_data is None:
+        return
+    call = entry_data["coordinator"].active_call
+    if not call or not call.get("session_id") or not call.get("sdp"):
+        return
+    previous = entry_data.get(ANSWERER_KEY)
+    if previous is not None:
+        if previous.active or (previous.session_id == str(call["session_id"]) and previous.state == "idle"):
+            return
+        hass.async_create_task(previous.async_discard(), "bticino_intercom discard prepared answer")
+
+    answerer = EosCallAnswerer(hass, entry_data["account"], entry_data["signaling_client"], call)
+    entry_data[ANSWERER_KEY] = answerer
+    answerer.async_start_prepare()
+
+    @callback
+    def _expire(_now: Any) -> None:
+        answerer.cancel_expiry = None
+        if not answerer.active:
+            hass.async_create_task(answerer.async_discard(), "bticino_intercom discard prepared answer")
+
+    answerer.cancel_expiry = async_call_later(hass, PREPARED_TTL, _expire)
 
 
 class EosCallAnswerer:
@@ -192,7 +238,7 @@ class EosCallAnswerer:
         self.call = dict(call)
         self.session_id: str = str(call["session_id"])
         self.module_id: str | None = call.get("module_id")
-        self._max_duration = max_duration
+        self.max_duration = max_duration
         self.state = "idle"  # idle, answering, connected, ended
         self._peer: Any = None
         self._remote_candidates: list[dict[str, Any]] = []
@@ -204,6 +250,10 @@ class EosCallAnswerer:
         self._lifetime_task: asyncio.Task[None] | None = None
         self._closed = False
         self._on_end_callbacks: list[Any] = []
+        self._prepare_task: asyncio.Task[None] | None = None
+        self._ice_server_count = 0
+        # Cancels the expiry of a prepared answer (set by async_prepare_call).
+        self.cancel_expiry: Callable[[], None] | None = None
 
     @property
     def active(self) -> bool:
@@ -223,6 +273,7 @@ class EosCallAnswerer:
         """
         if self.state != "idle":
             raise CallAnswerError("This call has already been answered")
+        self._stop_expiry()
         device_sdp = self.call.get("sdp")
         if not device_sdp:
             raise CallAnswerError("The device offer has not arrived: the call cannot be answered")
@@ -254,11 +305,82 @@ class EosCallAnswerer:
             self._async_lifetime(), f"bticino_intercom call {self.session_id}"
         )
 
+    @callback
+    def async_start_prepare(self) -> None:
+        """Get the answer ready while the call rings, without answering.
+
+        Builds the peer connection on the device offer and gathers our ICE
+        candidates, the slow part of answering (STUN on every interface took
+        ~5 s); it also opens the signaling connection. Nothing reaches the
+        device or the cloud: the call is answered only by async_answer.
+        """
+        if self.state != "idle" or self._prepare_task is not None or not self.call.get("sdp"):
+            return
+        self._prepare_task = self.hass.async_create_background_task(
+            self._async_prepare(), f"bticino_intercom prepare {self.session_id}"
+        )
+
+    async def _async_prepare(self) -> None:
+        from .camera import _async_prepare_signaling
+
+        started = asyncio.get_running_loop().time()
+        try:
+            await self._async_build_peer(self.call["sdp"])
+            await _async_prepare_signaling(self._signaling, self.call)
+        except Exception as err:  # answering builds again from scratch
+            _LOGGER.debug("Call %s: could not prepare the answer: %s", self.session_id, err)
+            await self._async_close_peer()
+            return
+        _LOGGER.debug("Call %s: answer prepared in %.1fs", self.session_id, asyncio.get_running_loop().time() - started)
+
+    async def async_discard(self) -> None:
+        """Drop a prepared answer that was never used (the call was not answered here)."""
+        if self.active or self._closed:
+            return
+        self._stop_expiry()
+        self._closed = True
+        self.state = "ended"
+        if self._prepare_task is not None and not self._prepare_task.done():
+            self._prepare_task.cancel()
+        await self._async_close_peer()
+        _LOGGER.debug("Call %s: prepared answer discarded", self.session_id)
+
+    @callback
+    def _stop_expiry(self) -> None:
+        if self.cancel_expiry is not None:
+            self.cancel_expiry()
+            self.cancel_expiry = None
+
+    async def _async_close_peer(self) -> None:
+        for sink in self._sinks:
+            sink.cancel()
+        if self._peer is not None:
+            with suppress(Exception):
+                await self._peer.close()
+        self._peer = None
+        self._remote_described = False
+
     async def _async_negotiate(self, device_sdp: str) -> None:
+        from .camera import _async_prepare_signaling
+
+        if self._prepare_task is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await self._prepare_task
+        if self._peer is None:
+            await self._async_build_peer(device_sdp)
+
+        await _async_prepare_signaling(self._signaling, self.call)
+        self._take_signaling()
+        peer = self._peer
+
+        answer = await peer.createAnswer()
+        await peer.setLocalDescription(answer)  # candidates already gathered when prepared
+        await self._send_answer(peer, device_sdp)
+
+    async def _async_build_peer(self, device_sdp: str) -> None:
+        """Peer connection on the device offer, with our candidates gathered."""
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
         from aiortc.mediastreams import AudioStreamTrack
-
-        from .camera import _async_prepare_signaling
 
         _patch_dtls_ciphers()
         try:
@@ -266,9 +388,7 @@ class EosCallAnswerer:
         except Exception as err:
             _LOGGER.warning("Could not load STUN servers (%s); answering with host candidates only", err)
             ice_servers = []
-
-        await _async_prepare_signaling(self._signaling, self.call)
-        self._take_signaling()
+        self._ice_server_count = len(ice_servers)
 
         peer = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self._peer = peer
@@ -295,8 +415,15 @@ class EosCallAnswerer:
         self._remote_described = True
         await self._apply_remote_candidates()
 
-        answer = await peer.createAnswer()
-        await peer.setLocalDescription(answer)  # gathers our candidates
+        # Gather our candidates now rather than in setLocalDescription, which
+        # gathers the same transports and finds them done. aiortc has no public
+        # call for it; without it answering only takes longer.
+        gather = getattr(peer, "_RTCPeerConnection__gather", None)
+        if gather is not None:
+            await gather()
+
+    async def _send_answer(self, peer: Any, device_sdp: str) -> None:
+        """Send our answer, then trickle our candidates as the app does."""
         answer_sdp, candidates = split_candidates(peer.localDescription.sdp)
 
         # Each send goes to the client's current session, which a live view
@@ -315,7 +442,7 @@ class EosCallAnswerer:
             "Call %s: answer sent with %d local candidates (%d STUN servers)",
             self.session_id,
             len(candidates),
-            len(ice_servers),
+            self._ice_server_count,
         )
 
     async def _wait_connected(self) -> None:
@@ -332,7 +459,7 @@ class EosCallAnswerer:
     async def _async_lifetime(self) -> None:
         """Keep the call until it ends on either side or reaches its maximum length."""
         try:
-            await asyncio.wait_for(self._ended.wait(), timeout=self._max_duration)
+            await asyncio.wait_for(self._ended.wait(), timeout=self.max_duration)
         except TimeoutError:
             await self.async_hangup(reason="maximum duration reached")
             return

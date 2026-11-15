@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -301,4 +302,74 @@ async def test_service_helpers(hass: HomeAssistant, account: SimpleNamespace) ->
     await async_hangup_call(hass, "entry1")
     assert current_answerer(hass, "entry1") is None
     assert device.terminated == [SESSION_ID]
+    await device.pc.close()
+
+
+def _entry_with_call(hass: HomeAssistant, account: SimpleNamespace, device: FakeDevice, call: dict) -> None:
+    hass.data[DOMAIN] = {
+        "entry1": {
+            "coordinator": SimpleNamespace(active_call=call),
+            "account": account,
+            "signaling_client": device,
+        },
+    }
+
+
+@media
+async def test_prepared_answer_sends_nothing_and_is_reused(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """Preparing at the ring gathers our candidates but leaves the call ringing."""
+    device = FakeDevice()
+    _entry_with_call(hass, account, device, _call(await device.make_offer()))
+
+    call_answerer.async_prepare_call(hass, "entry1")
+    prepared = hass.data[DOMAIN]["entry1"][ANSWERER_KEY]
+    await prepared._prepare_task
+    assert prepared.state == "idle"
+    assert prepared._peer is not None
+    assert current_answerer(hass, "entry1") is None  # a live view is still allowed
+    # Nothing reached the device or the cloud: no answer, no unmute.
+    assert device.answers == []
+    assert device.raw == []
+
+    # A second signal for the same ring keeps the same preparation.
+    call_answerer.async_prepare_call(hass, "entry1")
+    assert hass.data[DOMAIN]["entry1"][ANSWERER_KEY] is prepared
+
+    await async_answer_call(hass, "entry1", max_duration=30)
+    assert hass.data[DOMAIN]["entry1"][ANSWERER_KEY] is prepared
+    assert prepared.state == "connected"
+    assert prepared.max_duration == 30
+    assert [m["data"] for m in device.raw] == [{"type": "player", "value": "unmute"}]
+    await async_hangup_call(hass, "entry1")
+    await device.pc.close()
+
+
+@media
+async def test_prepared_answer_dropped_by_next_ring_or_ttl(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """An unused preparation is dropped quietly: no terminate, the ring is not ours."""
+    from homeassistant.util.dt import utcnow
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    device = FakeDevice()
+    first_call = _call(await device.make_offer())
+    _entry_with_call(hass, account, device, first_call)
+    call_answerer.async_prepare_call(hass, "entry1")
+    first = hass.data[DOMAIN]["entry1"][ANSWERER_KEY]
+    await first._prepare_task
+
+    # The next ring replaces it.
+    hass.data[DOMAIN]["entry1"]["coordinator"].active_call = {**first_call, "session_id": "another-ring"}
+    call_answerer.async_prepare_call(hass, "entry1")
+    second = hass.data[DOMAIN]["entry1"][ANSWERER_KEY]
+    assert second is not first
+    await hass.async_block_till_done()
+    assert first.state == "ended"
+    assert first._peer is None
+
+    # Left unanswered, it expires.
+    await second._prepare_task
+    async_fire_time_changed(hass, utcnow() + timedelta(seconds=call_answerer.PREPARED_TTL + 1))
+    await hass.async_block_till_done()
+    assert second.state == "ended"
+    assert device.terminated == []
     await device.pc.close()
