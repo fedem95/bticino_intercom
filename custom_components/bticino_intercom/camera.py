@@ -81,6 +81,15 @@ def _candidate_type(candidate: str) -> str:
     return "unknown"
 
 
+_SDP_DIGEST_PREFIXES = ("m=", "a=mid:", "a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive", "a=setup:")
+_SDP_DIGEST_PREFIXES += ("a=rtpmap:", "a=fmtp:", "a=ssrc:", "a=msid:", "a=group:", "a=extmap:")
+
+
+def _sdp_digest(sdp: str) -> str:
+    """The SDP lines that decide what media flows, without keys or addresses."""
+    return "\n".join(line for line in sdp.splitlines() if line.startswith(_SDP_DIGEST_PREFIXES))
+
+
 def _is_forwardable_candidate(candidate: str) -> bool:
     """Return whether a browser ICE candidate is worth sending to the device.
 
@@ -1117,8 +1126,20 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 # Both sides offered: each gets a real answer to its own offer,
                 # built from the other side's media and transport.
                 device_offer_sdp = active_call["sdp"]
-                await self._signaling.send_answer(self.answer_for_device(device_offer_sdp, browser_offer_sdp))
-                send_message(WebRTCAnswer(answer=self.answer_for_browser(browser_offer_sdp, device_offer_sdp)))
+                device_answer = self.answer_for_device(device_offer_sdp, browser_offer_sdp)
+                browser_answer = self.answer_for_browser(browser_offer_sdp, device_offer_sdp)
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    # The SDPs say which codecs and directions each side got:
+                    # what to read when audio or video does not flow.
+                    for label, sdp in (
+                        ("device offer", device_offer_sdp),
+                        ("browser offer", browser_offer_sdp),
+                        ("answer to device", device_answer),
+                        ("answer to browser", browser_answer),
+                    ):
+                        _LOGGER.debug("Answer mode %s:\n%s", label, _sdp_digest(sdp))
+                await self._signaling.send_answer(device_answer)
+                send_message(WebRTCAnswer(answer=browser_answer))
                 # This is the app's preview: the indoor monitor keeps ringing
                 # until answer_call sends the green handset's unmute.
                 async_bridge_started(self.hass, self.coordinator.entry.entry_id, active_call)
