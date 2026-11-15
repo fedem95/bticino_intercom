@@ -4,11 +4,11 @@
   "after_dependencies": ["media_source"],
   "codeowners": ["@k-the-hidden-hero"],
   "config_flow": true,
-  "dependencies": ["diagnostics", "http"],
+  "dependencies": ["diagnostics", "http", "network"],
   "documentation": "https://github.com/k-the-hidden-hero/bticino_intercom",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/k-the-hidden-hero/bticino_intercom/issues",
   "loggers": ["pybticino", "aiortc", "aioice"],
   "requirements": ["pybticino>=1.9.0", "firebase-messaging>=0.4.5", "aiortc>=1.16.0"],
-  "version": "2.0.4-rc21"
+  "version": "2.0.4-rc22"
 }

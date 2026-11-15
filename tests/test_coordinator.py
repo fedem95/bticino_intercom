@@ -203,6 +203,22 @@ class TestRtcTerminate:
         assert last["module_id"] == BRIDGE_MAC
 
 
+class TestAcceptedCallStopsRinging:
+    """accepted_call marks the call taken, so it no longer shows as ringing."""
+
+    async def test_accepted_marks_the_call(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_accepted_call: dict,
+    ) -> None:
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        assert not coordinator.active_call.get("accepted")
+        await coordinator._process_websocket_event(ws_accepted_call)
+        assert coordinator.active_call is not None
+        assert coordinator.active_call["accepted"] is True
+
+
 class TestCallEndedHere:
     """A call answered from Home Assistant and hung up here."""
 

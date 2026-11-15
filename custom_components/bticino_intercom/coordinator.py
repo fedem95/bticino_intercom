@@ -747,6 +747,9 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             # status-only call has completed once it is accepted.
             if self._active_call and self._active_call.get("status_only"):
                 self._active_call = None
+            elif self._active_call:
+                # Someone took the call: it no longer rings (camera attribute incoming_call).
+                self._active_call["accepted"] = True
 
             self.data[DATA_LAST_EVENT] = {
                 "type": EVENT_TYPE_ACCEPTED_CALL,
@@ -894,6 +897,7 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
             self._end_call_session(module_id, reason="hangup")
         self._fire_call_event("end", module_id, reason="hangup")
         self._active_call = None
+        self.async_update_listeners()
 
     def fire_call_timeout(self, module_id: str) -> None:
         """Fire an end event when the call times out."""

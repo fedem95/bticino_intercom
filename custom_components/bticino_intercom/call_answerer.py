@@ -30,6 +30,7 @@ import secrets
 import warnings
 from collections.abc import Callable
 from contextlib import suppress
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.core import HomeAssistant, callback
@@ -64,6 +65,53 @@ _dtls_patched = False
 
 class CallAnswerError(Exception):
     """The call could not be answered."""
+
+
+# The addresses our ICE candidates may come from, while a peer gathers them.
+_ice_addresses: ContextVar[frozenset[str] | None] = ContextVar("bticino_ice_addresses", default=None)
+
+
+def _filter_host_addresses() -> None:
+    """Make aioice gather on the allowed addresses only, while _ice_addresses is set.
+
+    aioice gathers a host (and a STUN) candidate on every address of every
+    interface: on Home Assistant OS also the Docker bridges and any VLAN
+    interface, whose STUN requests time out. That took ~5 s per call and gave
+    the device 18 candidates to try. Home Assistant's own network settings say
+    which interfaces to use. Other aioice users are unaffected: outside our
+    gathering the context variable is unset and every address is returned.
+    """
+    import aioice.ice
+
+    current = aioice.ice.get_host_addresses
+    if getattr(current, "_bticino_filter", False):
+        return
+
+    def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+        addresses = current(use_ipv4=use_ipv4, use_ipv6=use_ipv6)
+        allowed = _ice_addresses.get()
+        if not allowed:
+            return addresses
+        return [address for address in addresses if address in allowed] or addresses
+
+    get_host_addresses._bticino_filter = True  # type: ignore[attr-defined]
+    aioice.ice.get_host_addresses = get_host_addresses
+
+
+async def _async_enabled_addresses(hass: HomeAssistant) -> frozenset[str]:
+    """Addresses of the interfaces enabled in Home Assistant's network settings (empty if unknown)."""
+    from homeassistant.components import network
+
+    try:
+        adapters = await network.async_get_adapters(hass)
+    except Exception:
+        return frozenset()
+    return frozenset(
+        str(configured["address"])
+        for adapter in adapters
+        if adapter["enabled"]
+        for configured in (*adapter["ipv4"], *adapter["ipv6"])
+    )
 
 
 def _import_aiortc_quietly() -> None:
@@ -561,7 +609,12 @@ class EosCallAnswerer:
         # call for it; without it answering only takes longer.
         gather = getattr(peer, "_RTCPeerConnection__gather", None)
         if gather is not None:
-            await gather()
+            _filter_host_addresses()
+            token = _ice_addresses.set(await _async_enabled_addresses(self.hass))
+            try:
+                await gather()
+            finally:
+                _ice_addresses.reset(token)
 
     async def _send_answer(self, peer: Any, device_sdp: str) -> None:
         """Send our answer, then trickle our candidates as the app does."""

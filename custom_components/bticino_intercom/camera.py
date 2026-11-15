@@ -460,6 +460,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.STREAM
     _attr_entity_registry_enabled_default = True
+    _unrecorded_attributes = frozenset({"incoming_call_session"})
 
     # Seconds to wait for the device's answer; None means ANSWER_TIMEOUT_SECONDS.
     _answer_timeout: float | None = None
@@ -510,6 +511,20 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
     def available(self) -> bool:
         """Return True if the coordinator has data and bridge is known."""
         return self.coordinator.last_update_success and self.coordinator.main_device_id is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Whether this unit is ringing now, nobody having taken the call yet.
+
+        A card opened after the ring event missed it; this lets it show the
+        ring anyway (and the session, so it shows each ring once).
+        """
+        call = self.coordinator.active_call
+        ringing = bool(call and call.get("module_id") == self._module_id and not call.get("accepted"))
+        attributes: dict[str, Any] = {"incoming_call": ringing}
+        if ringing:
+            attributes["incoming_call_session"] = call.get("session_id")
+        return attributes
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
         """Return a "press play" card for the live view.

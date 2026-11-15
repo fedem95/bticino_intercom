@@ -178,6 +178,44 @@ def _coordinator(call: dict[str, Any] | None, bridge_type: str = "BNCX") -> Simp
     )
 
 
+def test_ice_gathers_on_the_enabled_addresses_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While a peer gathers, only Home Assistant's enabled addresses; otherwise all of them."""
+    import aioice.ice
+
+    every = ["192.168.1.30", "172.30.32.1", "172.31.20.1"]
+    monkeypatch.setattr(aioice.ice, "get_host_addresses", lambda use_ipv4, use_ipv6: list(every))
+    call_answerer._filter_host_addresses()
+    call_answerer._filter_host_addresses()  # once is enough
+
+    assert aioice.ice.get_host_addresses(use_ipv4=True, use_ipv6=False) == every
+    token = call_answerer._ice_addresses.set(frozenset({"192.168.1.30", "fe80::1"}))
+    try:
+        assert aioice.ice.get_host_addresses(use_ipv4=True, use_ipv6=False) == ["192.168.1.30"]
+    finally:
+        call_answerer._ice_addresses.reset(token)
+    # Nothing allowed is up: gather everywhere rather than nowhere.
+    token = call_answerer._ice_addresses.set(frozenset({"10.9.9.9"}))
+    try:
+        assert aioice.ice.get_host_addresses(use_ipv4=True, use_ipv6=False) == every
+    finally:
+        call_answerer._ice_addresses.reset(token)
+
+
+async def test_enabled_addresses_come_from_the_network_settings(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from homeassistant.components import network
+
+    adapters = [
+        {"enabled": True, "ipv4": [{"address": "192.168.1.30"}], "ipv6": [{"address": "fe80::1"}]},
+        {"enabled": False, "ipv4": [{"address": "172.30.32.1"}], "ipv6": []},
+    ]
+    monkeypatch.setattr(network, "async_get_adapters", AsyncMock(return_value=adapters))
+    assert await call_answerer._async_enabled_addresses(hass) == frozenset({"192.168.1.30", "fe80::1"})
+    monkeypatch.setattr(network, "async_get_adapters", AsyncMock(side_effect=KeyError("network")))
+    assert await call_answerer._async_enabled_addresses(hass) == frozenset()
+
+
 async def test_player_message_uses_pybticino_when_it_has_it() -> None:
     """With a pybticino that sends the player message, the call's session is selected and it is used."""
     signaling = SimpleNamespace(_send=AsyncMock(), send_player=AsyncMock(), set_session_from_push=MagicMock())
