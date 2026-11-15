@@ -1,0 +1,794 @@
+"""Answer an incoming Classe 300 EOS call from Home Assistant, as the app does.
+
+Traced from the official Android app (com.netatmo.camera 4.1.1.3) answering a
+real call, answering is two steps:
+
+1. The app answers the device offer (received through FCM) with an SDP answer
+   and its microphone track muted: the video preview. The cloud then tells the
+   other phones that someone answered (``rescind``), but the indoor monitor
+   keeps ringing and, left there, the call ends as missed after ~27 s.
+2. On the green handset the app sends an rtc ``{"type": "player", "value":
+   "unmute"}`` message on the call's session and unmutes its microphone. The
+   device stops ringing and reports ``accepted_call`` within ~100 ms.
+
+Home Assistant does both in one go, as the media peer itself (aiortc): it
+answers the offer, waits for the media to connect, then sends ``unmute``.
+
+Device quirks worked around, found by answering real calls with aiortc:
+
+- the device presents an RSA DTLS certificate, while aiortc offers only
+  ECDHE-ECDSA cipher suites: the cipher list is widened (_patch_dtls_ciphers);
+- a relay candidate of our own makes the device nominate a pair the Netatmo
+  TURN server refuses (403 Forbidden IP): only STUN servers are used.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+import warnings
+from collections.abc import Callable
+from contextlib import suppress
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
+
+from .const import ANSWER_BRIDGE_TYPES, DOMAIN
+
+if TYPE_CHECKING:
+    from pybticino import AsyncAccount, SignalingClient
+
+_LOGGER = logging.getLogger(__name__)
+
+# The device rings for about 30 s; an answer later than that finds no call.
+CONNECT_TIMEOUT = 20  # seconds from our answer to a connected media session
+DEFAULT_MAX_DURATION = 120  # seconds an answered call stays open at most
+ANSWER_SETTLE = 0.5  # seconds between our answer and our first candidate
+PREPARED_TTL = 60  # seconds a prepared, unused answer is kept (a ring lasts ~27 s)
+
+# ECDHE-RSA and plain RSA suites as a browser offers them, ECDSA first so a
+# peer with an ECDSA certificate negotiates as before.
+_DTLS_CIPHERS = (
+    b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+    b"ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+    b"ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+    b"ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:"
+    b"ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:"
+    b"AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA"
+)
+_dtls_patched = False
+
+
+class CallAnswerError(Exception):
+    """The call could not be answered."""
+
+
+# The addresses our ICE candidates may come from, while a peer gathers them.
+_ice_addresses: ContextVar[frozenset[str] | None] = ContextVar("bticino_ice_addresses", default=None)
+
+
+def _filter_host_addresses() -> None:
+    """Make aioice gather on the allowed addresses only, while _ice_addresses is set.
+
+    aioice gathers a host (and a STUN) candidate on every address of every
+    interface: on Home Assistant OS also the Docker bridges and any VLAN
+    interface, whose STUN requests time out. That took ~5 s per call and gave
+    the device 18 candidates to try. Home Assistant's own network settings say
+    which interfaces to use. Other aioice users are unaffected: outside our
+    gathering the context variable is unset and every address is returned.
+    """
+    import aioice.ice
+
+    current = aioice.ice.get_host_addresses
+    if getattr(current, "_bticino_filter", False):
+        return
+
+    def get_host_addresses(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+        addresses = current(use_ipv4=use_ipv4, use_ipv6=use_ipv6)
+        allowed = _ice_addresses.get()
+        if not allowed:
+            return addresses
+        return [address for address in addresses if address in allowed] or addresses
+
+    get_host_addresses._bticino_filter = True  # type: ignore[attr-defined]
+    aioice.ice.get_host_addresses = get_host_addresses
+
+
+async def _async_enabled_addresses(hass: HomeAssistant) -> frozenset[str]:
+    """Addresses of the interfaces enabled in Home Assistant's network settings (empty if unknown)."""
+    from homeassistant.components import network
+
+    try:
+        adapters = await network.async_get_adapters(hass)
+    except Exception:
+        return frozenset()
+    return frozenset(
+        str(configured["address"])
+        for adapter in adapters
+        if adapter["enabled"]
+        for configured in (*adapter["ipv4"], *adapter["ipv6"])
+    )
+
+
+def _import_aiortc_quietly() -> None:
+    """Import aiortc without google-crc32c's warning about its pure Python build.
+
+    aiortc needs crc32c only for SCTP data channels, which these calls never
+    open; on Home Assistant OS the package comes without its C extension and
+    warns once, on the first import, that it is slower.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*google-crc32c.*", category=RuntimeWarning)
+        import aiortc  # noqa: F401
+
+
+def _patch_dtls_ciphers() -> None:
+    """Let aiortc negotiate DTLS with a peer that has an RSA certificate.
+
+    Wraps aiortc's SSL context factory and widens the cipher list it sets;
+    everything else in the context stays as aiortc builds it. Done once per
+    process. Without it the handshake fails at once ("DTLS handshake failed").
+    """
+    global _dtls_patched
+    if _dtls_patched:
+        return
+    from aiortc.rtcdtlstransport import RTCCertificate
+
+    original = RTCCertificate._create_ssl_context
+
+    def _create_ssl_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        ctx = original(self, *args, **kwargs)
+        ctx.set_cipher_list(_DTLS_CIPHERS)
+        return ctx
+
+    RTCCertificate._create_ssl_context = _create_ssl_context
+    _dtls_patched = True
+
+
+def stun_servers(raw_servers: list[dict[str, Any]]) -> list[Any]:
+    """Return aiortc ICE servers with the STUN URLs only, no TURN.
+
+    The device offers its own relay candidates anyway. With a relay candidate
+    on our side, the device nominated a pair that the Netatmo TURN server
+    refused to relay (403 Forbidden IP on channel bind) and the call failed.
+    """
+    from aiortc import RTCIceServer
+
+    servers = []
+    for raw in raw_servers:
+        urls = raw.get("urls", raw.get("url"))
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list):
+            continue
+        stun = [url for url in urls if isinstance(url, str) and url.startswith("stun:")]
+        if stun:
+            servers.append(RTCIceServer(urls=stun))
+    return servers
+
+
+def split_candidates(sdp: str) -> tuple[str, list[tuple[int, str]]]:
+    """Split a gathered SDP into the SDP without candidates and its candidates.
+
+    The candidates are trickled one by one after the answer, as the app does;
+    the answer itself carries none. Returns (sdp, [(m-line index, candidate)]).
+    """
+    kept: list[str] = []
+    candidates: list[tuple[int, str]] = []
+    index = -1
+    for line in sdp.splitlines():
+        if line.startswith("m="):
+            index += 1
+        if line.startswith("a=candidate:") and index >= 0:
+            candidates.append((index, line.removeprefix("a=")))
+            continue
+        if line == "a=end-of-candidates":
+            continue
+        kept.append(line)
+    return "\r\n".join(kept) + "\r\n", candidates
+
+
+ANSWERER_KEY = "call_answerer"
+# A ringing call that a view (the camera's answer mode) has answered with the
+# browser as the media peer: the app's preview. answer_call then only sends the
+# green handset's unmute on that session.
+BRIDGED_KEY = "bridged_call"
+
+
+async def async_send_player(signaling: SignalingClient, call: dict[str, Any], value: str) -> None:
+    """Send the app's rtc "player" message on `call`'s session (``unmute`` takes the call).
+
+    ``unmute`` toggles: a second one mutes the call again, so send it once.
+    A pybticino without ``send_player`` gets the message built here as the
+    app builds it (traced from com.netatmo.camera 4.1.1.3).
+    """
+    send_player = getattr(signaling, "send_player", None)
+    if send_player is not None:  # pybticino with the player message
+        session_id = str(call["session_id"])
+        signaling.set_session_from_push(
+            session_id=session_id,
+            tag_id=call.get("tag_id") or "",
+            correlation_id=str(call.get("correlation_id") or ""),
+            device_id=call.get("device_id") or "",
+        )
+        await send_player(value, session_id=session_id)
+        return
+    message = {
+        "action": "rtc",
+        "data": {"type": "player", "value": value},
+        "session_id": str(call["session_id"]),
+        "tag_id": call.get("tag_id") or "",
+        "device_id": call.get("device_id") or "",
+        # The server wants a positive long in a string (^\d+$).
+        "correlation_id": str(secrets.randbits(62) + 1),
+    }
+    await signaling._send(message)
+    _LOGGER.debug("Call %s: player %s sent", call["session_id"], value)
+
+
+@callback
+def async_bridge_started(hass: HomeAssistant, entry_id: str, call: dict[str, Any]) -> None:
+    """A view answered the ringing call (the preview): answer_call will only unmute it.
+
+    The answer prepared for this ring is dropped: the device has its answer.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if entry_data is None or not answering_supported(entry_data["coordinator"]):
+        # Other bridges: the view's answer stays as it always was, no unmute.
+        return
+    entry_data[BRIDGED_KEY] = {"call": dict(call), "unmuted": False}
+    prepared = entry_data.get(ANSWERER_KEY)
+    if prepared is not None and not prepared.active:
+        hass.async_create_task(prepared.async_discard(), "bticino_intercom discard prepared answer")
+
+
+@callback
+def async_bridge_ended(hass: HomeAssistant, entry_id: str, session_id: str | None) -> None:
+    """The view that answered `session_id` closed."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    bridged = entry_data.get(BRIDGED_KEY) if entry_data else None
+    if bridged is not None and str(bridged["call"]["session_id"]) == str(session_id):
+        entry_data.pop(BRIDGED_KEY, None)
+        if bridged["unmuted"]:
+            # The view hangs up the call it took (the camera terminates it).
+            entry_data["coordinator"].async_call_ended_here(str(session_id))
+
+
+def answering_supported(coordinator: Any) -> bool:
+    """Return whether this bridge's calls may be answered from Home Assistant (ANSWER_BRIDGE_TYPES)."""
+    bridge_id = getattr(coordinator, "main_device_id", None)
+    modules = (getattr(coordinator, "data", None) or {}).get("modules", {})
+    return bool(bridge_id) and modules.get(bridge_id, {}).get("type") in ANSWER_BRIDGE_TYPES
+
+
+def current_answerer(hass: HomeAssistant, entry_id: str) -> EosCallAnswerer | None:
+    """Return the call this entry is answering or holding, if any."""
+    answerer = hass.data.get(DOMAIN, {}).get(entry_id, {}).get(ANSWERER_KEY)
+    return answerer if answerer is not None and answerer.active else None
+
+
+async def async_answer_call(
+    hass: HomeAssistant,
+    entry_id: str,
+    max_duration: float = DEFAULT_MAX_DURATION,
+    *,
+    from_view: bool = False,
+) -> None:
+    """Answer the entry's ringing call from Home Assistant. Raises HomeAssistantError.
+
+    With ``from_view`` (a card whose stream just connected) only a ring that a
+    view has answered is taken, with the unmute; anything else is left alone
+    and nothing is raised: the card calls it after every connection, and most
+    are ordinary live views.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if from_view:
+        bridged = (entry_data or {}).get(BRIDGED_KEY)
+        call = entry_data["coordinator"].active_call if entry_data else None
+        if (
+            bridged is None
+            or bridged["unmuted"]
+            or not call
+            or str(bridged["call"]["session_id"]) != str(call.get("session_id"))
+        ):
+            _LOGGER.debug("answer_call from a view: no ring answered by a view to take")
+            return
+    if entry_data is None:
+        raise HomeAssistantError("BTicino intercom not loaded")
+    if not answering_supported(entry_data["coordinator"]):
+        raise HomeAssistantError("Answering calls from Home Assistant is supported on the Classe 300 EOS only")
+    if current_answerer(hass, entry_id):
+        raise HomeAssistantError("A call is already answered from Home Assistant")
+    call = entry_data["coordinator"].active_call
+    if not call or not call.get("session_id"):
+        raise HomeAssistantError("No incoming call to answer")
+    if not call.get("sdp"):
+        raise HomeAssistantError(
+            "The call offer has not reached Home Assistant (for a Classe 300 EOS it comes through FCM)"
+        )
+
+    # A view on the phone already has the call (the preview): take it there,
+    # the media stays between the phone and the device.
+    bridged = entry_data.get(BRIDGED_KEY)
+    if bridged is not None and str(bridged["call"]["session_id"]) == str(call["session_id"]):
+        if bridged["unmuted"]:
+            raise HomeAssistantError("The call is already answered")
+        try:
+            await async_send_player(entry_data["signaling_client"], bridged["call"], "unmute")
+        except Exception as err:
+            raise HomeAssistantError(f"Could not take the call: {err}") from err
+        bridged["unmuted"] = True
+        _LOGGER.info("Call %s answered on the open view (player unmute)", call["session_id"])
+        return
+
+    answerer = entry_data.get(ANSWERER_KEY)
+    if answerer is None or answerer.session_id != str(call["session_id"]) or answerer.state != "idle":
+        if answerer is not None:
+            await answerer.async_discard()
+        answerer = EosCallAnswerer(hass, entry_data["account"], entry_data["signaling_client"], call)
+        entry_data[ANSWERER_KEY] = answerer
+    answerer.max_duration = max_duration
+    coordinator = entry_data["coordinator"]
+    answerer.async_on_end(lambda: coordinator.async_call_ended_here(answerer.session_id))
+    _LOGGER.info("Answering call %s from Home Assistant", answerer.session_id)
+    try:
+        await answerer.async_answer()
+    except CallAnswerError as err:
+        raise HomeAssistantError(str(err)) from err
+
+
+async def async_hangup_call(hass: HomeAssistant, entry_id: str) -> None:
+    """Hang up the call answered from Home Assistant, if there is one."""
+    if answerer := current_answerer(hass, entry_id):
+        await answerer.async_hangup()
+        return
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id) or {}
+    bridged = entry_data.get(BRIDGED_KEY)
+    if bridged is not None and bridged["unmuted"]:
+        call = bridged["call"]
+        signaling = entry_data["signaling_client"]
+        signaling.set_session_from_push(
+            session_id=str(call["session_id"]),
+            tag_id=call.get("tag_id") or "",
+            correlation_id=str(call.get("correlation_id") or ""),
+            device_id=call.get("device_id") or "",
+        )
+        try:
+            await signaling.send_terminate(str(call["session_id"]))
+        finally:
+            entry_data.pop(BRIDGED_KEY, None)
+            entry_data["coordinator"].async_call_ended_here(str(call["session_id"]))
+        _LOGGER.info("Call %s hung up (answered on the open view)", call["session_id"])
+
+
+async def async_release_call(hass: HomeAssistant, entry_id: str) -> None:
+    """On unload: hang up a call answered here and drop a prepared answer."""
+    await async_hangup_call(hass, entry_id)
+    if answerer := hass.data.get(DOMAIN, {}).get(entry_id, {}).get(ANSWERER_KEY):
+        await answerer.async_discard()
+
+
+@callback
+def async_prepare_call(hass: HomeAssistant, entry_id: str) -> None:
+    """Get the ringing call's answer ready, so answering takes about a second.
+
+    Called when a device offer arrives. Sends nothing: the call stays ringing
+    until async_answer_call. An unused preparation is dropped after
+    PREPARED_TTL seconds, or when the next call comes in.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if entry_data is None or not answering_supported(entry_data["coordinator"]):
+        return
+    call = entry_data["coordinator"].active_call
+    if not call or not call.get("session_id") or not call.get("sdp"):
+        return
+    previous = entry_data.get(ANSWERER_KEY)
+    if previous is not None:
+        if previous.active or (previous.session_id == str(call["session_id"]) and previous.state == "idle"):
+            return
+        hass.async_create_task(previous.async_discard(), "bticino_intercom discard prepared answer")
+
+    answerer = EosCallAnswerer(hass, entry_data["account"], entry_data["signaling_client"], call)
+    entry_data[ANSWERER_KEY] = answerer
+    answerer.async_start_prepare()
+
+    @callback
+    def _expire(_now: Any) -> None:
+        answerer.cancel_expiry = None
+        if not answerer.active:
+            hass.async_create_task(answerer.async_discard(), "bticino_intercom discard prepared answer")
+
+    answerer.cancel_expiry = async_call_later(hass, PREPARED_TTL, _expire)
+
+
+class EosCallAnswerer:
+    """One incoming call answered by Home Assistant as a WebRTC peer.
+
+    Owns the shared signaling client's callbacks while the call lasts, so no
+    live view may run alongside it (the device would refuse a second peer
+    anyway). Create one per call; it cannot be reused.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        account: AsyncAccount,
+        signaling: SignalingClient,
+        call: dict[str, Any],
+        max_duration: float = DEFAULT_MAX_DURATION,
+    ) -> None:
+        """Prepare to answer `call` (the coordinator's active call, with the device SDP)."""
+        self.hass = hass
+        self._account = account
+        self._signaling = signaling
+        self.call = dict(call)
+        self.session_id: str = str(call["session_id"])
+        self.module_id: str | None = call.get("module_id")
+        self.max_duration = max_duration
+        self.state = "idle"  # idle, answering, connected, ended
+        self._peer: Any = None
+        self._remote_candidates: list[dict[str, Any]] = []
+        self._remote_described = False
+        self._connected = asyncio.Event()
+        self._ended = asyncio.Event()
+        self._remote_ended = False
+        self._sinks: list[asyncio.Task[None]] = []
+        self._lifetime_task: asyncio.Task[None] | None = None
+        self._closed = False
+        self._on_end_callbacks: list[Any] = []
+        self._prepare_task: asyncio.Task[None] | None = None
+        self._ice_server_count = 0
+        # Cancels the expiry of a prepared answer (set by async_prepare_call).
+        self.cancel_expiry: Callable[[], None] | None = None
+
+    @property
+    def active(self) -> bool:
+        """Return whether the call is being answered or in progress."""
+        return self.state in ("answering", "connected")
+
+    @callback
+    def async_on_end(self, func: Any) -> None:
+        """Call `func()` once the call has ended."""
+        self._on_end_callbacks.append(func)
+
+    async def async_answer(self) -> None:
+        """Answer the device offer and wait until the media session is up.
+
+        Raises CallAnswerError when the call cannot be answered or the media
+        does not connect in time; the session is terminated in that case.
+        """
+        if self.state != "idle":
+            raise CallAnswerError("This call has already been answered")
+        self._stop_expiry()
+        device_sdp = self.call.get("sdp")
+        if not device_sdp:
+            raise CallAnswerError("The device offer has not arrived: the call cannot be answered")
+        self.state = "answering"
+        try:
+            await self._async_negotiate(device_sdp)
+            try:
+                await asyncio.wait_for(self._wait_connected(), timeout=CONNECT_TIMEOUT)
+            except TimeoutError as err:
+                raise CallAnswerError(f"The media session did not connect within {CONNECT_TIMEOUT}s") from err
+        except Exception as err:
+            await self.async_hangup(reason="answer failed")
+            if isinstance(err, CallAnswerError):
+                raise
+            raise CallAnswerError(f"Could not answer the call: {err}") from err
+
+        if self._closed:  # hung up while the media was connecting
+            raise CallAnswerError("The call was hung up while answering")
+        # The media alone is only the preview: this is the green handset, which
+        # makes the device stop ringing and report the call as accepted.
+        try:
+            await self._send_player("unmute")
+        except Exception as err:
+            await self.async_hangup(reason="unmute failed")
+            raise CallAnswerError(f"Could not take the call: {err}") from err
+        self.state = "connected"
+        _LOGGER.info("Call %s answered from Home Assistant: media connected, unmuted", self.session_id)
+        self._lifetime_task = self.hass.async_create_background_task(
+            self._async_lifetime(), f"bticino_intercom call {self.session_id}"
+        )
+
+    @callback
+    def async_start_prepare(self) -> None:
+        """Get the answer ready while the call rings, without answering.
+
+        Builds the peer connection on the device offer and gathers our ICE
+        candidates, the slow part of answering (STUN on every interface took
+        ~5 s); it also opens the signaling connection. Nothing reaches the
+        device or the cloud: the call is answered only by async_answer.
+        """
+        if self.state != "idle" or self._prepare_task is not None or not self.call.get("sdp"):
+            return
+        self._prepare_task = self.hass.async_create_background_task(
+            self._async_prepare(), f"bticino_intercom prepare {self.session_id}"
+        )
+
+    async def _async_ready_signaling(self) -> None:
+        """Connect the shared signaling client with a fresh token, as a live view does."""
+        await self._signaling.ensure_connected()
+        await self._signaling.resubscribe()
+        # A reconnect forgets the sessions the client knew.
+        self._register_session()
+
+    async def _async_prepare(self) -> None:
+        started = asyncio.get_running_loop().time()
+        try:
+            await self._async_build_peer(self.call["sdp"])
+            await self._async_ready_signaling()
+        except Exception as err:  # answering builds again from scratch
+            _LOGGER.debug("Call %s: could not prepare the answer: %s", self.session_id, err)
+            await self._async_close_peer()
+            return
+        _LOGGER.debug("Call %s: answer prepared in %.1fs", self.session_id, asyncio.get_running_loop().time() - started)
+
+    async def async_discard(self) -> None:
+        """Drop a prepared answer that was never used (the call was not answered here)."""
+        if self.active or self._closed:
+            return
+        self._stop_expiry()
+        self._closed = True
+        self.state = "ended"
+        if self._prepare_task is not None and not self._prepare_task.done():
+            self._prepare_task.cancel()
+        await self._async_close_peer()
+        _LOGGER.debug("Call %s: prepared answer discarded", self.session_id)
+
+    @callback
+    def _stop_expiry(self) -> None:
+        if self.cancel_expiry is not None:
+            self.cancel_expiry()
+            self.cancel_expiry = None
+
+    async def _async_close_peer(self) -> None:
+        for sink in self._sinks:
+            sink.cancel()
+        if self._peer is not None:
+            with suppress(Exception):
+                await self._peer.close()
+        self._peer = None
+        self._remote_described = False
+
+    async def _async_negotiate(self, device_sdp: str) -> None:
+        if self._prepare_task is not None:
+            with suppress(Exception, asyncio.CancelledError):
+                await self._prepare_task
+        if self._peer is None:
+            await self._async_build_peer(device_sdp)
+
+        await self._async_ready_signaling()
+        self._take_signaling()
+        peer = self._peer
+
+        answer = await peer.createAnswer()
+        await peer.setLocalDescription(answer)  # candidates already gathered when prepared
+        await self._send_answer(peer, device_sdp)
+
+    async def _async_build_peer(self, device_sdp: str) -> None:
+        """Peer connection on the device offer, with our candidates gathered."""
+        _import_aiortc_quietly()
+        from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+        from aiortc.mediastreams import AudioStreamTrack
+
+        _patch_dtls_ciphers()
+        try:
+            ice_servers = stun_servers(await self._account.async_get_turn_servers())
+        except Exception as err:
+            _LOGGER.warning("Could not load STUN servers (%s); answering with host candidates only", err)
+            ice_servers = []
+        self._ice_server_count = len(ice_servers)
+
+        peer = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        self._peer = peer
+        # The app's microphone track; silence for now (the user's microphone
+        # comes with the two-way audio step).
+        peer.addTrack(AudioStreamTrack())
+
+        @peer.on("track")
+        def _on_track(track: Any) -> None:
+            _LOGGER.debug("Call %s: receiving %s from the device", self.session_id, track.kind)
+            self._sinks.append(self.hass.async_create_background_task(self._drain(track), "bticino drain"))
+
+        @peer.on("connectionstatechange")
+        async def _on_state() -> None:
+            state = peer.connectionState
+            _LOGGER.debug("Call %s: media %s", self.session_id, state)
+            if state == "connected":
+                self._connected.set()
+            elif state in ("failed", "closed"):
+                self._ended.set()
+
+        # Netatmo labels the device SDP "call"; for WebRTC it is an offer.
+        await peer.setRemoteDescription(RTCSessionDescription(sdp=device_sdp, type="offer"))
+        self._remote_described = True
+        await self._apply_remote_candidates()
+
+        # Gather our candidates now rather than in setLocalDescription, which
+        # gathers the same transports and finds them done. aiortc has no public
+        # call for it; without it answering only takes longer.
+        gather = getattr(peer, "_RTCPeerConnection__gather", None)
+        if gather is not None:
+            _filter_host_addresses()
+            token = _ice_addresses.set(await _async_enabled_addresses(self.hass))
+            try:
+                await gather()
+            finally:
+                _ice_addresses.reset(token)
+
+    async def _send_answer(self, peer: Any, device_sdp: str) -> None:
+        """Send our answer, then trickle our candidates as the app does."""
+        answer_sdp, candidates = split_candidates(peer.localDescription.sdp)
+
+        # Every send names this call's session; registering it first keeps it
+        # known to the shared client after a reconnect in between.
+        self._register_session()
+        await self._signaling.send_answer(answer_sdp, session_id=self.session_id)
+        # The server refuses candidates that reach it before it has processed
+        # the answer ("Received ICE candidate before answer"), so leave it a moment.
+        await asyncio.sleep(ANSWER_SETTLE)
+        for m_line, candidate in candidates:
+            self._register_session()
+            await self._signaling.send_candidate(candidate, m_line, session_id=self.session_id)
+        _LOGGER.debug(
+            "Call %s: answer sent with %d local candidates (%d STUN servers)",
+            self.session_id,
+            len(candidates),
+            self._ice_server_count,
+        )
+
+    async def _wait_connected(self) -> None:
+        connected = asyncio.ensure_future(self._connected.wait())
+        ended = asyncio.ensure_future(self._ended.wait())
+        try:
+            await asyncio.wait({connected, ended}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (connected, ended):
+                task.cancel()
+        if not self._connected.is_set():
+            raise CallAnswerError("The call ended before the media session connected")
+
+    async def _async_lifetime(self) -> None:
+        """Keep the call until it ends on either side or reaches its maximum length."""
+        try:
+            await asyncio.wait_for(self._ended.wait(), timeout=self.max_duration)
+        except TimeoutError:
+            await self.async_hangup(reason="maximum duration reached")
+            return
+        if self._remote_ended:
+            await self.async_hangup(reason="ended by the device", terminate=False)
+        else:
+            # The media dropped without a word from the device: free its slot.
+            await self.async_hangup(reason="media lost")
+
+    async def async_hangup(self, reason: str = "hung up", terminate: bool = True) -> None:
+        """End the call: terminate the session on the device and close the media."""
+        if self._closed:
+            return
+        self._closed = True
+        self.state = "ended"
+        self._ended.set()
+        if self._lifetime_task and self._lifetime_task is not asyncio.current_task():
+            self._lifetime_task.cancel()
+        await self._log_media_stats()
+        if terminate and not self._remote_ended:
+            self._register_session()
+            try:
+                await self._signaling.send_terminate(self.session_id)
+            except Exception as err:
+                _LOGGER.debug("Call %s: terminate not sent: %s", self.session_id, err)
+        for sink in self._sinks:
+            sink.cancel()
+        if self._peer is not None:
+            with suppress(Exception):
+                await self._peer.close()
+        self._release_signaling()
+        _LOGGER.info("Call %s ended (%s)", self.session_id, reason)
+        for func in self._on_end_callbacks:
+            with suppress(Exception):
+                func()
+
+    # --- signaling ---
+
+    def _register_session(self) -> None:
+        """Make sure the shared signaling client knows this call's session.
+
+        A reconnect in between (idle connection, a server error) forgets it.
+        """
+        self._signaling.set_session_from_push(
+            session_id=self.session_id,
+            tag_id=self.call.get("tag_id") or "",
+            correlation_id=str(self.call.get("correlation_id") or ""),
+            device_id=self.call.get("device_id") or "",
+        )
+
+    async def _send_player(self, value: str) -> None:
+        await async_send_player(self._signaling, self.call, value)
+
+    def _take_signaling(self) -> None:
+        """Route the signaling client's callbacks here; live views set their own again."""
+        self._signaling._on_answer = self._on_signaling_answer
+        self._signaling._on_candidate = self._on_signaling_candidate
+        self._signaling._on_event = self._on_signaling_event
+
+    def _release_signaling(self) -> None:
+        if self._signaling._on_candidate == self._on_signaling_candidate:
+            self._signaling._on_answer = None
+            self._signaling._on_candidate = None
+            self._signaling._on_event = None
+
+    async def _on_signaling_answer(self, session_id: str, _sdp: str) -> None:
+        _LOGGER.debug("Ignoring an SDP answer for session %s while answering a call", session_id)
+
+    async def _on_signaling_candidate(self, session_id: str, candidate: dict[str, Any]) -> None:
+        if session_id != self.session_id or self._closed:
+            return
+        self._remote_candidates.append(candidate)
+        await self._apply_remote_candidates()
+
+    async def _on_signaling_event(self, session_id: str, event_type: str, message: dict[str, Any]) -> None:
+        if session_id != self.session_id:
+            return
+        error = (message.get("data") or {}).get("error") or {}
+        _LOGGER.info(
+            "Call %s: %s from the device%s",
+            self.session_id,
+            event_type,
+            f" ({error.get('message')})" if error else "",
+        )
+        if event_type in ("terminate", "rescind"):
+            self._remote_ended = True
+            self._ended.set()
+
+    async def _apply_remote_candidates(self) -> None:
+        if not self._remote_described or self._peer is None:
+            return
+        from aiortc.sdp import candidate_from_sdp
+
+        while self._remote_candidates:
+            payload = self._remote_candidates.pop(0)
+            raw = payload.get("candidate")
+            if not isinstance(raw, str) or not raw:
+                continue
+            try:
+                candidate = candidate_from_sdp(raw.removeprefix("a=").removeprefix("candidate:"))
+            except (ValueError, IndexError):
+                _LOGGER.debug("Call %s: unreadable device candidate %r", self.session_id, raw)
+                continue
+            candidate.sdpMid = payload.get("sdp_mid") or payload.get("sdpMid")
+            m_line = payload.get("sdp_m_line_index", payload.get("sdpMLineIndex", 0))
+            candidate.sdpMLineIndex = int(m_line) if m_line is not None else 0
+            await self._peer.addIceCandidate(candidate)
+
+    # --- media ---
+
+    async def _drain(self, track: Any) -> None:
+        """Consume a device track (to be played to the user in a later step)."""
+        from aiortc.mediastreams import MediaStreamError
+
+        with suppress(MediaStreamError, asyncio.CancelledError):
+            while True:
+                await track.recv()
+
+    async def _log_media_stats(self) -> None:
+        """Log how much media flowed each way: proof the call was a real one."""
+        if self._peer is None:
+            return
+        try:
+            stats = await self._peer.getStats()
+        except Exception:
+            return
+        flows = []
+        for item in stats.values():
+            kind = getattr(item, "kind", "?")
+            if getattr(item, "type", "") == "inbound-rtp":
+                flows.append(f"{kind} in={getattr(item, 'packetsReceived', '?')}")
+            elif getattr(item, "type", "") == "outbound-rtp":
+                flows.append(f"{kind} out={getattr(item, 'packetsSent', '?')}")
+        if flows:
+            _LOGGER.info("Call %s media packets: %s", self.session_id, ", ".join(sorted(flows)))

@@ -12,6 +12,18 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.bticino_intercom.const import DOMAIN
 from custom_components.bticino_intercom.coordinator import BticinoIntercomCoordinator
 
+
+@pytest.fixture(autouse=True)
+def no_answer_preparation():
+    """Do not prepare an answer on every simulated ring.
+
+    The preparation is a real aiortc peer gathering ICE candidates, which opens
+    sockets the HA harness forbids. test_call_answerer drives it directly.
+    """
+    with patch("custom_components.bticino_intercom.async_prepare_call"):
+        yield
+
+
 # --- Constants matching real captured data ---
 
 HOME_ID = "67bdb3ed5b5e8e648a0b80f6"
