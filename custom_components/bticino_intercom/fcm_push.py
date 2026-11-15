@@ -109,17 +109,6 @@ async def async_start_fcm_listener(
             return
         rtc_type = push.get("extra_params", {}).get("data", {}).get("type")
         _LOGGER.debug("FCM %s push (%s)", push.get("push_type"), rtc_type)
-        # TEMP EOS-DIAG — dump completo dei push -rtc per capire il rescind a ~300 ms.
-        # Rimuovere dopo la prova dal vivo.
-        try:
-            _LOGGER.warning(
-                "EOS-DIAG push %s (%s): %s",
-                push.get("push_type"),
-                rtc_type,
-                json.dumps(push, default=str, ensure_ascii=False),
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning("EOS-DIAG push %s (%s): <non serializzabile> %r", push.get("push_type"), rtc_type, push)
         hass.async_create_task(
             coordinator._handle_websocket_message(push),
             f"{DOMAIN} FCM push - {entry.entry_id}",

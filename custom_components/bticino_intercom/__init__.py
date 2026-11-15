@@ -27,12 +27,13 @@ from homeassistant.core import (
 from homeassistant.core import (
     Event as HAEvent,  # Re-add HAEvent type hint
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from pybticino import AsyncAccount, AuthHandler, SignalingClient, WebsocketClient
 from pybticino.exceptions import ApiError, AuthError, PyBticinoException
 
+from .call_answerer import DEFAULT_MAX_DURATION, async_answer_call, async_hangup_call
 from .const import (
     DOMAIN,
     PLATFORMS,
@@ -284,6 +285,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coord._active_call = None
 
     hass.services.async_register(DOMAIN, "reject_call", _async_reject_call)
+
+    # --- answer_call / hangup_call: Home Assistant answers as the media peer ---
+    def _service_entry_id(call: ServiceCall) -> str:
+        entry_id = call.data.get("entry_id") or next(iter(hass.data.get(DOMAIN, {})), None)
+        if not entry_id or entry_id not in hass.data.get(DOMAIN, {}):
+            raise HomeAssistantError("No BTicino intercom entry found")
+        return entry_id
+
+    async def _async_answer_call(call: ServiceCall) -> None:
+        max_duration = float(call.data.get("max_duration", DEFAULT_MAX_DURATION))
+        await async_answer_call(hass, _service_entry_id(call), max_duration=max_duration)
+
+    async def _async_hangup_call(call: ServiceCall) -> None:
+        await async_hangup_call(hass, _service_entry_id(call))
+
+    hass.services.async_register(DOMAIN, "answer_call", _async_answer_call)
+    hass.services.async_register(DOMAIN, "hangup_call", _async_hangup_call)
 
     # Register static files for blueprint sound
     from pathlib import Path
@@ -563,6 +581,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Stop FCM and remove its push context from the account
         if fcm_listener := entry_data.pop(FCM_LISTENER_KEY, None):
             await fcm_listener.async_stop()
+
+        # Hang up a call answered from Home Assistant before its signaling goes
+        await async_hangup_call(hass, entry.entry_id)
 
         # Clean up signaling client
         signaling = entry_data.pop(SIGNALING_CLIENT_KEY, None)

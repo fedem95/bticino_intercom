@@ -7,6 +7,7 @@ DOMAIN = "bticino_intercom"
 PLATFORMS: list[Platform] = [
     Platform.LOCK,
     Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.SENSOR,
     Platform.LIGHT,
     Platform.CAMERA,

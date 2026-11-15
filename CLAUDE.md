@@ -54,6 +54,7 @@ The integration supports WebRTC live video streaming via the Netatmo cloud.
 - **Two modes**:
   - **Offer mode** (on-demand): HA sends SDP offer to the device via Netatmo cloud, receives SDP answer back. Used for live viewing from the dashboard.
   - **Answer mode** (incoming call): Device sends SDP offer via push when someone rings; `coordinator.active_call` keeps it and the camera answers it with the browser's SDP. Classe 100X/300X send the offer on the push WebSocket; a Classe 300 EOS (BNCX) only through FCM, received by `fcm_push.py` with the user's local `bticino_intercom_fcm.json` (the Netatmo app's Firebase identity: never commit it or put it in code).
+  - **Answered from HA** (`call_answerer.py`, service `answer_call` / button "Answer call"): the EOS counts a call as answered only when a real media session with audio is up (there is no "accept" message), so HA answers the device offer itself as an aiortc peer and sends audio at once. Device workarounds: wider DTLS cipher list (RSA certificate), STUN only (no own relay candidate), stereo OPUS mirrored. While such a call is up, live views are refused (the answerer owns the signaling callbacks and the device peer slot).
 - **Audio**: The device mic requires real RTP audio packets to activate (not just SDP `sendrecv` negotiation). A custom Lovelace card from [bticino_ha_extras](https://github.com/k-the-hidden-hero/bticino_ha_extras) is needed to send audio and unmute playback, since HA's built-in camera player mutes audio by design.
 - **SDP manipulation**: `camera.py` contains SDP manipulation methods (direction forcing, codec reordering) that were explored during development. These are currently disabled because the audio issue is RTP-related, not SDP-related.
 - **Session timeout**: ~30s in offer mode (device-side behavior, not configurable from the client).
@@ -92,4 +93,4 @@ logger:
 
 ## Version & Dependencies
 
-Version is tracked in `manifest.json` (`version` field). The sole runtime dependency is `pybticino>=1.0`.
+Version is tracked in `manifest.json` (`version` field). Runtime dependencies are the manifest `requirements`: `pybticino`, `firebase-messaging` (EOS call offers through FCM) and `aiortc` (answering a call as a media peer; 1.16+ is the first that accepts Home Assistant's `av` 19).

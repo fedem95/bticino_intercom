@@ -28,6 +28,7 @@ from pybticino import AsyncAccount, SignalingClient
 from pybticino.exceptions import PyBticinoException
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
+from .call_answerer import current_answerer
 from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
 from .coordinator import BticinoIntercomCoordinator
 from .utils import cleanup_orphaned_entities, format_timestamp_iso, get_module_subtype
@@ -135,6 +136,7 @@ RING_END_WAIT = 10  # seconds to wait for a ring to end before giving up
 RING_END_POLL = 0.5
 RING_END_SETTLE = 1.5  # the device frees the slot shortly after missed/accepted
 RINGING_BUSY_MESSAGE = "The intercom is ringing: answer it from the BTicino app, or retry when the ring ends."
+ANSWERED_IN_HA_MESSAGE = "Home Assistant is on a call with the intercom: hang up first."
 _signaling_last_used: WeakKeyDictionary[SignalingClient, float] = WeakKeyDictionary()
 
 
@@ -1017,6 +1019,12 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
             send_message(WebRTCError(code="no_device", message="No bridge device found"))
             return
 
+        # Home Assistant is itself on a call with the device: it owns the
+        # signaling callbacks and the device has no peer slot for a live view.
+        if current_answerer(self.hass, self.coordinator.entry.entry_id):
+            send_message(WebRTCError(code="answered_in_ha", message=ANSWERED_IN_HA_MESSAGE))
+            return
+
         self._session_ready = False
         self._pending_candidates.clear()
         # Keep the browser's own offer: the answer we hand back has to line up
@@ -1323,6 +1331,10 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         # signaling client's current session id so we still terminate when the
         # offer was acked but never answered (issue #58 / #60).
         signaling_session_id = self._signaling_session_id or self._signaling.session_id
+        answerer = current_answerer(self.hass, self.coordinator.entry.entry_id)
+        if answerer and signaling_session_id == answerer.session_id:
+            # That session is the call answered from Home Assistant, not this view's.
+            signaling_session_id = None
         _LOGGER.info(
             "Closing WebRTC session for %s (signaling_session=%s)",
             self._module_id,
