@@ -48,6 +48,7 @@ Communicates with the BTicino/Netatmo cloud API via the [pybticino](https://gith
 | **Sensor — Last Call Timestamp** | Timestamp sensor for the most recent completed call. |
 | **Sensor — Bridge Diagnostics** | Uptime, WiFi strength, WebSocket status, local IP, last seen, last config update. |
 | **Light** | Staircase lights (BNSL modules). On/off control. |
+| **Button — Answer call / Hang up call** | Classe 300 EOS: answer the ringing call from Home Assistant, and hang it up (see [answering calls](#classe-300-eos-answering-calls-experimental)). |
 
 ### Real-time events
 
@@ -327,7 +328,7 @@ intercoms:
 | Safari / iOS (any browser) | Not supported | All iOS browsers use WebKit. The BTicino device firmware uses Chrome-specific RTP payload types — see [Firefox investigation](docs/firefox-webrtc-investigation.md) |
 | Firefox | Not supported | Device firmware bug: hardcoded Chrome RTP payload types (PT=111/Opus, PT=109/H264) |
 | HA Companion (Android) | Supported | Uses system WebView (Chromium) |
-| HA Companion (iOS) | Not supported | Uses WebKit (same limitation as Safari) |
+| HA Companion (iOS) | Not supported | Uses WebKit (same limitation as Safari). Exception: answering a Classe 300 EOS ring with the card works, video and two-way audio (see below) |
 
 > [!NOTE]
 > The browser limitation is caused by the BTicino device firmware (BNC1), which hardcodes Chrome/libwebrtc RTP payload type numbers in its media engine regardless of SDP negotiation. This cannot be fixed from the integration side. The official Netatmo app works on iOS because it bundles the same `libwebrtc` engine as Chrome, not because it does any special handling.
@@ -345,7 +346,33 @@ python -m pybticino.fcm com.netatmo.camera.apk bticino_intercom_fcm.json
 
 Copy `bticino_intercom_fcm.json` to the Home Assistant config directory (next to `configuration.yaml`) and reload the integration. Keep the file private and never commit it. The log then shows `Receiving call offers through FCM`; without the file the integration behaves as before.
 
-While the intercom rings, opening the intercom's camera answers the call: the other phones get "someone answered" and stop ringing. Merely receiving the offer does not answer anything. Unloading the integration removes the push token from the account.
+Merely receiving the offer does not answer anything. Unloading the integration removes the push token from the account.
+
+#### How a Classe 300 EOS call is answered
+
+Answering is two steps, as in the official app (traced from the Android app answering a real call):
+
+1. **Preview**: an SDP answer to the device offer. The cloud tells the other phones that someone answered, but the indoor monitor keeps ringing, and left there the call ends as *missed* after about 27 s.
+2. **Take the call** (the app's green handset): an rtc `{"type": "player", "value": "unmute"}` message on the call's session. The indoor monitor stops ringing and the device reports `accepted_call`.
+
+The integration always does both, in one of these ways:
+
+| How you answer | What you get |
+|---|---|
+| **The card** ([bticino_ha_extras](https://github.com/k-the-hidden-hero/bticino_ha_extras)): open the external unit while it rings, or tap *answer* on its ring screen | Video and two-way audio on the phone, which connects straight to the intercom. The card starts the microphone and takes the call itself once connected. |
+| **A notification action** opening the card's view with `?answer=<camera entity>` in the URL (e.g. `/dashboard/intercom?answer=camera.front_door`) | The same, from the notification. |
+| **The "Answer call" button** or the `bticino_intercom.answer_call` service, with no view open | Home Assistant answers as the media peer itself (with [aiortc](https://github.com/aiortc/aiortc)): the call is taken and stops ringing everywhere, but nobody sees or hears it. Useful to stop the ring. Takes about 2 s: the answer is prepared while the call rings, and nothing is sent until you answer. |
+
+Services:
+
+- `bticino_intercom.answer_call` — answer the ringing call (`max_duration` in seconds, default 120). With `from_view: true` (what the card sends) it only takes a ring that a view has answered, and does nothing otherwise.
+- `bticino_intercom.hangup_call` — hang up a call answered from Home Assistant or taken on a view.
+
+Notes:
+
+- Two-way audio needs the card (the built-in camera player mutes audio) and HTTPS for the microphone.
+- Reloading the page ends the call: the phone's WebRTC connection is gone, and the intercom does not resume an answered call on a new one.
+- Tested on iPhone (Home Assistant app, iOS 18) with the card: video, two-way audio, rotation without dropping the call. Known issue: back in portrait after a rotation the video area may stay cut and hide the call buttons.
 
 ### Reporting issues
 
@@ -365,6 +392,7 @@ When reporting a v2.0 bug:
 - Home Assistant 2026.5.0 or later
 - A BTicino Classe 100X, 300X or 300 EOS, or a BTicino/Legrand EasyKit, connected to the Netatmo cloud
 - [pybticino](https://github.com/k-the-hidden-hero/pybticino) >= 1.9.0 (installed automatically)
+- [aiortc](https://github.com/aiortc/aiortc) >= 1.16 (installed automatically; used to answer Classe 300 EOS calls from Home Assistant)
 
 ---
 
