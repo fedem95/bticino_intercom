@@ -28,7 +28,7 @@ from pybticino import AsyncAccount, SignalingClient
 from pybticino.exceptions import PyBticinoException
 from webrtc_models import RTCConfiguration, RTCIceCandidateInit, RTCIceServer
 
-from .call_answerer import current_answerer
+from .call_answerer import async_bridge_ended, async_bridge_started, current_answerer
 from .const import DOMAIN, IMAGE_CACHE_SECONDS, SUBTYPE_EXTERNAL_UNIT
 from .coordinator import BticinoIntercomCoordinator
 from .utils import cleanup_orphaned_entities, format_timestamp_iso, get_module_subtype
@@ -1119,6 +1119,9 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                 device_offer_sdp = active_call["sdp"]
                 await self._signaling.send_answer(self.answer_for_device(device_offer_sdp, browser_offer_sdp))
                 send_message(WebRTCAnswer(answer=self.answer_for_browser(browser_offer_sdp, device_offer_sdp)))
+                # This is the app's preview: the indoor monitor keeps ringing
+                # until answer_call sends the green handset's unmute.
+                async_bridge_started(self.hass, self.coordinator.entry.entry_id, active_call)
             else:
                 # --- Offer mode: initiate on-demand call ---
                 _LOGGER.info("Sending WebRTC offer to device %s (module=%s)", device_id, self._module_id)
@@ -1344,6 +1347,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
         self._session_ready = False
         self._pending_candidates.clear()
         self._signaling_session_id = None
+        async_bridge_ended(self.hass, self.coordinator.entry.entry_id, signaling_session_id)
         if signaling_session_id:
             # Point the shared signaling client at this camera's session so
             # send_terminate uses the correct session_id.  HA runs on a

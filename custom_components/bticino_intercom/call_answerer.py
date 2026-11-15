@@ -132,6 +132,53 @@ def split_candidates(sdp: str) -> tuple[str, list[tuple[int, str]]]:
 
 
 ANSWERER_KEY = "call_answerer"
+# A ringing call that a view (the camera's answer mode) has answered with the
+# browser as the media peer: the app's preview. answer_call then only sends the
+# green handset's unmute on that session.
+BRIDGED_KEY = "bridged_call"
+
+
+async def async_send_player(signaling: SignalingClient, call: dict[str, Any], value: str) -> None:
+    """Send the app's rtc "player" message on `call`'s session (``unmute`` takes the call).
+
+    pybticino has no sender for it, so the message is built here as the app
+    builds it (traced from com.netatmo.camera 4.1.1.3).
+    """
+    message = {
+        "action": "rtc",
+        "data": {"type": "player", "value": value},
+        "session_id": str(call["session_id"]),
+        "tag_id": call.get("tag_id") or "",
+        "device_id": call.get("device_id") or "",
+        # The server wants a positive long in a string (^\d+$).
+        "correlation_id": str(secrets.randbits(62) + 1),
+    }
+    await signaling._send(message)
+    _LOGGER.debug("Call %s: player %s sent", call["session_id"], value)
+
+
+@callback
+def async_bridge_started(hass: HomeAssistant, entry_id: str, call: dict[str, Any]) -> None:
+    """A view answered the ringing call (the preview): answer_call will only unmute it.
+
+    The answer prepared for this ring is dropped: the device has its answer.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if entry_data is None:
+        return
+    entry_data[BRIDGED_KEY] = {"call": dict(call), "unmuted": False}
+    prepared = entry_data.get(ANSWERER_KEY)
+    if prepared is not None and not prepared.active:
+        hass.async_create_task(prepared.async_discard(), "bticino_intercom discard prepared answer")
+
+
+@callback
+def async_bridge_ended(hass: HomeAssistant, entry_id: str, session_id: str | None) -> None:
+    """The view that answered `session_id` closed."""
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    bridged = entry_data.get(BRIDGED_KEY) if entry_data else None
+    if bridged is not None and str(bridged["call"]["session_id"]) == str(session_id):
+        entry_data.pop(BRIDGED_KEY, None)
 
 
 def current_answerer(hass: HomeAssistant, entry_id: str) -> EosCallAnswerer | None:
@@ -155,6 +202,20 @@ async def async_answer_call(hass: HomeAssistant, entry_id: str, max_duration: fl
             "The call offer has not reached Home Assistant (for a Classe 300 EOS it comes through FCM)"
         )
 
+    # A view on the phone already has the call (the preview): take it there,
+    # the media stays between the phone and the device.
+    bridged = entry_data.get(BRIDGED_KEY)
+    if bridged is not None and str(bridged["call"]["session_id"]) == str(call["session_id"]):
+        if bridged["unmuted"]:
+            raise HomeAssistantError("The call is already answered")
+        try:
+            await async_send_player(entry_data["signaling_client"], bridged["call"], "unmute")
+        except Exception as err:
+            raise HomeAssistantError(f"Could not take the call: {err}") from err
+        bridged["unmuted"] = True
+        _LOGGER.info("Call %s answered on the open view (player unmute)", call["session_id"])
+        return
+
     answerer = entry_data.get(ANSWERER_KEY)
     if answerer is None or answerer.session_id != str(call["session_id"]) or answerer.state != "idle":
         if answerer is not None:
@@ -173,6 +234,23 @@ async def async_hangup_call(hass: HomeAssistant, entry_id: str) -> None:
     """Hang up the call answered from Home Assistant, if there is one."""
     if answerer := current_answerer(hass, entry_id):
         await answerer.async_hangup()
+        return
+    entry_data = hass.data.get(DOMAIN, {}).get(entry_id) or {}
+    bridged = entry_data.get(BRIDGED_KEY)
+    if bridged is not None and bridged["unmuted"]:
+        call = bridged["call"]
+        signaling = entry_data["signaling_client"]
+        signaling.set_session_from_push(
+            session_id=str(call["session_id"]),
+            tag_id=call.get("tag_id") or "",
+            correlation_id=str(call.get("correlation_id") or ""),
+            device_id=call.get("device_id") or "",
+        )
+        try:
+            await signaling.send_terminate()
+        finally:
+            entry_data.pop(BRIDGED_KEY, None)
+        _LOGGER.info("Call %s hung up (answered on the open view)", call["session_id"])
 
 
 async def async_release_call(hass: HomeAssistant, entry_id: str) -> None:
@@ -511,22 +589,7 @@ class EosCallAnswerer:
         )
 
     async def _send_player(self, value: str) -> None:
-        """Send the app's rtc "player" message (``unmute`` takes the call).
-
-        pybticino has no sender for it, so the message is built here as the app
-        builds it (traced from com.netatmo.camera 4.1.1.3).
-        """
-        message = {
-            "action": "rtc",
-            "data": {"type": "player", "value": value},
-            "session_id": self.session_id,
-            "tag_id": self.call.get("tag_id") or "",
-            "device_id": self.call.get("device_id") or "",
-            # The server wants a positive long in a string (^\d+$).
-            "correlation_id": str(secrets.randbits(62) + 1),
-        }
-        await self._signaling._send(message)
-        _LOGGER.debug("Call %s: player %s sent", self.session_id, value)
+        await async_send_player(self._signaling, self.call, value)
 
     def _take_signaling(self) -> None:
         """Route the signaling client's callbacks here; live views set their own again."""

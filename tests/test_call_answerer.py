@@ -6,7 +6,7 @@ import asyncio
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.core import HomeAssistant
@@ -373,3 +373,49 @@ async def test_prepared_answer_dropped_by_next_ring_or_ttl(hass: HomeAssistant, 
     assert second.state == "ended"
     assert device.terminated == []
     await device.pc.close()
+
+
+async def test_answer_on_open_view_only_unmutes(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """With the phone's view on the call (the preview), answering is the app's green handset only."""
+    signaling = SimpleNamespace(
+        _send=AsyncMock(), set_session_from_push=MagicMock(), send_terminate=AsyncMock(), send_answer=AsyncMock()
+    )
+    call = _call("v=0\r\n")  # the device offer; the view already answered it
+    hass.data[DOMAIN] = {
+        "entry1": {"coordinator": SimpleNamespace(active_call=call), "account": account, "signaling_client": signaling}
+    }
+
+    call_answerer.async_bridge_started(hass, "entry1", call)
+    await async_answer_call(hass, "entry1")
+
+    # No second answer and no peer of our own: just the unmute on the view's session.
+    signaling.send_answer.assert_not_awaited()
+    assert ANSWERER_KEY not in hass.data[DOMAIN]["entry1"]
+    message = signaling._send.await_args.args[0]
+    assert message["data"] == {"type": "player", "value": "unmute"}
+    assert message["session_id"] == SESSION_ID
+    assert message["tag_id"] == "tag-1"
+    assert message["device_id"] == BRIDGE_MAC
+
+    with pytest.raises(HomeAssistantError, match="already answered"):
+        await async_answer_call(hass, "entry1")
+
+    await async_hangup_call(hass, "entry1")
+    signaling.set_session_from_push.assert_called_once()
+    assert signaling.set_session_from_push.call_args.kwargs["session_id"] == SESSION_ID
+    signaling.send_terminate.assert_awaited_once()
+    assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
+
+
+async def test_closed_view_is_forgotten(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """Once the view closes, its session is no longer answered by unmute."""
+    signaling = SimpleNamespace(_send=AsyncMock())
+    call = _call("v=0\r\n")
+    hass.data[DOMAIN] = {
+        "entry1": {"coordinator": SimpleNamespace(active_call=call), "account": account, "signaling_client": signaling}
+    }
+    call_answerer.async_bridge_started(hass, "entry1", call)
+    call_answerer.async_bridge_ended(hass, "entry1", "some-other-session")
+    assert call_answerer.BRIDGED_KEY in hass.data[DOMAIN]["entry1"]
+    call_answerer.async_bridge_ended(hass, "entry1", SESSION_ID)
+    assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
