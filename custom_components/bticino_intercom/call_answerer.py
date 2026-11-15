@@ -179,6 +179,9 @@ def async_bridge_ended(hass: HomeAssistant, entry_id: str, session_id: str | Non
     bridged = entry_data.get(BRIDGED_KEY) if entry_data else None
     if bridged is not None and str(bridged["call"]["session_id"]) == str(session_id):
         entry_data.pop(BRIDGED_KEY, None)
+        if bridged["unmuted"]:
+            # The view hangs up the call it took (the camera terminates it).
+            entry_data["coordinator"].async_call_ended_here(str(session_id))
 
 
 def current_answerer(hass: HomeAssistant, entry_id: str) -> EosCallAnswerer | None:
@@ -246,6 +249,8 @@ async def async_answer_call(
         answerer = EosCallAnswerer(hass, entry_data["account"], entry_data["signaling_client"], call)
         entry_data[ANSWERER_KEY] = answerer
     answerer.max_duration = max_duration
+    coordinator = entry_data["coordinator"]
+    answerer.async_on_end(lambda: coordinator.async_call_ended_here(answerer.session_id))
     _LOGGER.info("Answering call %s from Home Assistant", answerer.session_id)
     try:
         await answerer.async_answer()
@@ -273,6 +278,7 @@ async def async_hangup_call(hass: HomeAssistant, entry_id: str) -> None:
             await signaling.send_terminate()
         finally:
             entry_data.pop(BRIDGED_KEY, None)
+            entry_data["coordinator"].async_call_ended_here(str(call["session_id"]))
         _LOGGER.info("Call %s hung up (answered on the open view)", call["session_id"])
 
 

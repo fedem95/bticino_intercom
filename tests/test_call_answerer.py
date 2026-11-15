@@ -168,6 +168,11 @@ def _call(sdp: str | None) -> dict[str, Any]:
     }
 
 
+def _coordinator(call: dict[str, Any] | None) -> SimpleNamespace:
+    """The coordinator surface the answerer uses: the ringing call, and ending it."""
+    return SimpleNamespace(active_call=call, async_call_ended_here=MagicMock())
+
+
 @pytest.fixture
 def account() -> SimpleNamespace:
     return SimpleNamespace(async_get_turn_servers=AsyncMock(return_value=[]))
@@ -280,7 +285,7 @@ async def test_answer_without_device_offer_is_refused(hass: HomeAssistant, accou
 async def test_service_helpers(hass: HomeAssistant, account: SimpleNamespace) -> None:
     """async_answer_call checks for a call; the answerer is tracked and hung up by entry."""
     device = FakeDevice()
-    coordinator = SimpleNamespace(active_call=None)
+    coordinator = _coordinator(None)
     hass.data[DOMAIN] = {
         "entry1": {"coordinator": coordinator, "account": account, "signaling_client": device},
     }
@@ -302,13 +307,15 @@ async def test_service_helpers(hass: HomeAssistant, account: SimpleNamespace) ->
     await async_hangup_call(hass, "entry1")
     assert current_answerer(hass, "entry1") is None
     assert device.terminated == [SESSION_ID]
+    # Hung up here: the call is over for the coordinator too.
+    coordinator.async_call_ended_here.assert_called_once_with(SESSION_ID)
     await device.pc.close()
 
 
 def _entry_with_call(hass: HomeAssistant, account: SimpleNamespace, device: FakeDevice, call: dict) -> None:
     hass.data[DOMAIN] = {
         "entry1": {
-            "coordinator": SimpleNamespace(active_call=call),
+            "coordinator": _coordinator(call),
             "account": account,
             "signaling_client": device,
         },
@@ -382,7 +389,7 @@ async def test_answer_on_open_view_only_unmutes(hass: HomeAssistant, account: Si
     )
     call = _call("v=0\r\n")  # the device offer; the view already answered it
     hass.data[DOMAIN] = {
-        "entry1": {"coordinator": SimpleNamespace(active_call=call), "account": account, "signaling_client": signaling}
+        "entry1": {"coordinator": _coordinator(call), "account": account, "signaling_client": signaling}
     }
 
     call_answerer.async_bridge_started(hass, "entry1", call)
@@ -405,6 +412,7 @@ async def test_answer_on_open_view_only_unmutes(hass: HomeAssistant, account: Si
     assert signaling.set_session_from_push.call_args.kwargs["session_id"] == SESSION_ID
     signaling.send_terminate.assert_awaited_once()
     assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
+    hass.data[DOMAIN]["entry1"]["coordinator"].async_call_ended_here.assert_called_once_with(SESSION_ID)
 
 
 async def test_answer_from_view_only_takes_a_ring_the_view_answered(
@@ -413,7 +421,7 @@ async def test_answer_from_view_only_takes_a_ring_the_view_answered(
     """The card asks after every view: an ordinary live view must not answer anything."""
     signaling = SimpleNamespace(_send=AsyncMock(), send_answer=AsyncMock())
     call = _call("v=0\r\n")
-    coordinator = SimpleNamespace(active_call=None)
+    coordinator = _coordinator(None)
     hass.data[DOMAIN] = {"entry1": {"coordinator": coordinator, "account": account, "signaling_client": signaling}}
 
     # No ring at all: nothing, and no error for the card.
@@ -437,10 +445,25 @@ async def test_closed_view_is_forgotten(hass: HomeAssistant, account: SimpleName
     signaling = SimpleNamespace(_send=AsyncMock())
     call = _call("v=0\r\n")
     hass.data[DOMAIN] = {
-        "entry1": {"coordinator": SimpleNamespace(active_call=call), "account": account, "signaling_client": signaling}
+        "entry1": {"coordinator": _coordinator(call), "account": account, "signaling_client": signaling}
     }
+    coordinator = hass.data[DOMAIN]["entry1"]["coordinator"]
     call_answerer.async_bridge_started(hass, "entry1", call)
     call_answerer.async_bridge_ended(hass, "entry1", "some-other-session")
     assert call_answerer.BRIDGED_KEY in hass.data[DOMAIN]["entry1"]
     call_answerer.async_bridge_ended(hass, "entry1", SESSION_ID)
     assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
+    # Only a preview: the ring is not ours to end.
+    coordinator.async_call_ended_here.assert_not_called()
+
+
+async def test_closing_a_view_that_took_the_call_ends_it(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """The view hung up the call it took: no later view may answer that session again."""
+    signaling = SimpleNamespace(_send=AsyncMock())
+    call = _call("v=0\r\n")
+    coordinator = _coordinator(call)
+    hass.data[DOMAIN] = {"entry1": {"coordinator": coordinator, "account": account, "signaling_client": signaling}}
+    call_answerer.async_bridge_started(hass, "entry1", call)
+    await async_answer_call(hass, "entry1", from_view=True)
+    call_answerer.async_bridge_ended(hass, "entry1", SESSION_ID)
+    coordinator.async_call_ended_here.assert_called_once_with(SESSION_ID)

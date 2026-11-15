@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -877,6 +877,23 @@ class BticinoIntercomCoordinator(DataUpdateCoordinator):
         if closed_at is None:
             return False
         return (datetime.now(UTC) - closed_at).total_seconds() < CLOSED_SESSION_DEDUP_WINDOW
+
+    @callback
+    def async_call_ended_here(self, session_id: str) -> None:
+        """A call answered from Home Assistant was hung up here: it is over.
+
+        The device sends no terminate back for a session we end, so without
+        this the call would stay active and a view opened next would answer
+        a session that no longer exists.
+        """
+        if not self._active_call or str(self._active_call.get("session_id")) != str(session_id):
+            return
+        module_id = self._active_call.get("module_id")
+        self._mark_session_closed(session_id)
+        if module_id:
+            self._end_call_session(module_id, reason="hangup")
+        self._fire_call_event("end", module_id, reason="hangup")
+        self._active_call = None
 
     def fire_call_timeout(self, module_id: str) -> None:
         """Fire an end event when the call times out."""

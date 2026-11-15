@@ -203,6 +203,28 @@ class TestRtcTerminate:
         assert last["module_id"] == BRIDGE_MAC
 
 
+class TestCallEndedHere:
+    """A call answered from Home Assistant and hung up here."""
+
+    async def test_ends_the_active_call(
+        self,
+        coordinator: BticinoIntercomCoordinator,
+        ws_rtc_offer: dict,
+        ws_rtc_terminate: dict,
+    ) -> None:
+        """The call is over: no view may answer it again, and a late terminate is ignored."""
+        await coordinator._process_websocket_event(ws_rtc_offer)
+        session_id = coordinator.active_call["session_id"]
+
+        coordinator.async_call_ended_here("another-session")
+        assert coordinator.active_call is not None
+
+        coordinator.async_call_ended_here(session_id)
+        assert coordinator.active_call is None
+        assert coordinator._is_session_recently_closed(session_id)
+        assert await coordinator._process_websocket_event(ws_rtc_terminate) is False
+
+
 class TestRtcRescind:
     """Test RTC rescind event processing."""
 
