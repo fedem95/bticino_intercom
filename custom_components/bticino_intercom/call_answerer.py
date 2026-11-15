@@ -1,40 +1,32 @@
-"""Answer an incoming Classe 300 EOS call with a real WebRTC media session.
+"""Answer an incoming Classe 300 EOS call from Home Assistant, as the app does.
 
-A Classe 300 EOS only counts a call as answered (and stops ringing on the
-indoor monitor and on every other phone) once a real media session is up with
-it, audio included. There is no separate "accept" message: the official app
-answers the device offer, adds its microphone track, and the device takes the
-call when that media connects. The device also sends its own audio only after
-it receives audio from the peer.
+Traced from the official Android app (com.netatmo.camera 4.1.1.3) answering a
+real call, answering is two steps:
 
-The camera's answer mode bridges SDP between the device and the browser and
-leaves the media to the browser; when the browser does not complete the audio,
-the device sees no answer and the call ends as missed. Here Home Assistant is
-the peer itself (aiortc), as the official app is:
+1. The app answers the device offer (received through FCM) with an SDP answer
+   and its microphone track muted: the video preview. The cloud then tells the
+   other phones that someone answered (``rescind``), but the indoor monitor
+   keeps ringing and, left there, the call ends as missed after ~27 s.
+2. On the green handset the app sends an rtc ``{"type": "player", "value":
+   "unmute"}`` message on the call's session and unmutes its microphone. The
+   device stops ringing and reports ``accepted_call`` within ~100 ms.
 
-- it answers the device offer received through FCM with its own SDP,
-- it sends real audio at once (a soft tone for now, the user's microphone in a
-  later step), so the device takes the call and opens its own audio,
-- it receives the device audio and video.
+Home Assistant does both in one go, as the media peer itself (aiortc): it
+answers the offer, waits for the media to connect, then sends ``unmute``.
 
-Device quirks this works around, all found by answering real calls:
+Device quirks worked around, found by answering real calls with aiortc:
 
 - the device presents an RSA DTLS certificate, while aiortc offers only
   ECDHE-ECDSA cipher suites: the cipher list is widened (_patch_dtls_ciphers);
 - a relay candidate of our own makes the device nominate a pair the Netatmo
-  TURN server refuses (403 Forbidden IP): only STUN servers are used;
-- the device offers stereo OPUS and the app's answer mirrors it: so does ours.
+  TURN server refuses (403 Forbidden IP): only STUN servers are used.
 """
 
 from __future__ import annotations
 
-import array
 import asyncio
-import fractions
 import logging
-import math
-import re
-import time
+import secrets
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
@@ -52,14 +44,6 @@ _LOGGER = logging.getLogger(__name__)
 CONNECT_TIMEOUT = 20  # seconds from our answer to a connected media session
 DEFAULT_MAX_DURATION = 120  # seconds an answered call stays open at most
 ANSWER_SETTLE = 0.5  # seconds between our answer and our first candidate
-
-# Soft 440 Hz tone: real audio the device accepts as a peer talking, quiet
-# enough not to startle whoever is at the door. Silence is not enough: with a
-# silent track the device never opens its own audio.
-TONE_FREQUENCY = 440.0
-TONE_AMPLITUDE = 0.08
-TONE_SAMPLE_RATE = 8000
-TONE_PTIME = 0.020  # seconds of audio per frame, as aiortc's own tracks
 
 # ECDHE-RSA and plain RSA suites as a browser offers them, ECDSA first so a
 # peer with an ECDSA certificate negotiates as before.
@@ -123,49 +107,6 @@ def stun_servers(raw_servers: list[dict[str, Any]]) -> list[Any]:
     return servers
 
 
-def mirror_opus_fmtp(answer_sdp: str, offer_sdp: str) -> str:
-    """Make the answer's OPUS parameters mirror the device offer.
-
-    The device offers OPUS with ``sprop-stereo=1``. libwebrtc (the official
-    app) answers with ``stereo=1;sprop-stereo=1`` and the device's capture and
-    bitrate parameters; aiortc leaves them out. Add them to the answer.
-    """
-    opus_pt = None
-    for line in offer_sdp.splitlines():
-        if match := re.match(r"a=rtpmap:(\d+) opus/", line, re.IGNORECASE):
-            opus_pt = match.group(1)
-    if opus_pt is None:
-        return answer_sdp
-
-    prefix = f"a=fmtp:{opus_pt} "
-    offer_fmtp = next((line[len(prefix) :] for line in offer_sdp.splitlines() if line.startswith(prefix)), "")
-    wanted = ["stereo=1", "sprop-stereo=1"]
-    for part in (p.strip() for p in offer_fmtp.split(";")):
-        if part.split("=")[0] in ("sprop-maxcapturerate", "maxplaybackrate", "maxaveragebitrate"):
-            wanted.append(part)
-
-    lines = answer_sdp.splitlines()
-    out: list[str] = []
-    replaced = False
-    for line in lines:
-        if line.startswith(prefix):
-            params = [p.strip() for p in line[len(prefix) :].split(";") if p.strip()]
-            keys = {p.split("=")[0] for p in params}
-            params += [w for w in wanted if w.split("=")[0] not in keys]
-            out.append(prefix + ";".join(params))
-            replaced = True
-        else:
-            out.append(line)
-    if not replaced:
-        rebuilt: list[str] = []
-        for line in out:
-            rebuilt.append(line)
-            if re.match(rf"a=rtpmap:{opus_pt} opus/", line, re.IGNORECASE):
-                rebuilt.append(prefix + ";".join(wanted))
-        out = rebuilt
-    return "\r\n".join(out) + ("\r\n" if answer_sdp.endswith(("\r\n", "\n")) else "")
-
-
 def split_candidates(sdp: str) -> tuple[str, list[tuple[int, str]]]:
     """Split a gathered SDP into the SDP without candidates and its candidates.
 
@@ -185,48 +126,6 @@ def split_candidates(sdp: str) -> tuple[str, list[tuple[int, str]]]:
             continue
         kept.append(line)
     return "\r\n".join(kept) + "\r\n", candidates
-
-
-def _tone_track() -> Any:
-    """Return an aiortc audio track sending a soft continuous tone."""
-    from aiortc.mediastreams import AudioStreamTrack, MediaStreamError
-    from av import AudioFrame
-
-    class ToneTrack(AudioStreamTrack):
-        """Real audio for the device: a quiet sine tone in 20 ms frames."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self._samples = int(TONE_PTIME * TONE_SAMPLE_RATE)
-            self._timestamp = 0
-            self._start: float | None = None
-            omega = 2.0 * math.pi * TONE_FREQUENCY / TONE_SAMPLE_RATE
-            # One second of tone, a whole number of periods, looped seamlessly;
-            # twice over so any 20 ms window is one contiguous slice.
-            wave = array.array(
-                "h", (int(TONE_AMPLITUDE * 32767 * math.sin(omega * n)) for n in range(TONE_SAMPLE_RATE))
-            )
-            self._wave = (wave + wave).tobytes()
-
-        async def recv(self) -> Any:
-            if self.readyState != "live":
-                raise MediaStreamError
-            if self._start is None:
-                self._start = time.time()
-            else:
-                self._timestamp += self._samples
-                wait = self._start + self._timestamp / TONE_SAMPLE_RATE - time.time()
-                if wait > 0:
-                    await asyncio.sleep(wait)
-            start = (self._timestamp % TONE_SAMPLE_RATE) * 2  # bytes: 16-bit samples
-            frame = AudioFrame(format="s16", layout="mono", samples=self._samples)
-            frame.planes[0].update(self._wave[start : start + self._samples * 2])
-            frame.pts = self._timestamp
-            frame.sample_rate = TONE_SAMPLE_RATE
-            frame.time_base = fractions.Fraction(1, TONE_SAMPLE_RATE)
-            return frame
-
-    return ToneTrack()
 
 
 ANSWERER_KEY = "call_answerer"
@@ -342,14 +241,22 @@ class EosCallAnswerer:
 
         if self._closed:  # hung up while the media was connecting
             raise CallAnswerError("The call was hung up while answering")
+        # The media alone is only the preview: this is the green handset, which
+        # makes the device stop ringing and report the call as accepted.
+        try:
+            await self._send_player("unmute")
+        except Exception as err:
+            await self.async_hangup(reason="unmute failed")
+            raise CallAnswerError(f"Could not take the call: {err}") from err
         self.state = "connected"
-        _LOGGER.info("Call %s answered from Home Assistant: media connected", self.session_id)
+        _LOGGER.info("Call %s answered from Home Assistant: media connected, unmuted", self.session_id)
         self._lifetime_task = self.hass.async_create_background_task(
             self._async_lifetime(), f"bticino_intercom call {self.session_id}"
         )
 
     async def _async_negotiate(self, device_sdp: str) -> None:
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+        from aiortc.mediastreams import AudioStreamTrack
 
         from .camera import _async_prepare_signaling
 
@@ -365,7 +272,9 @@ class EosCallAnswerer:
 
         peer = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
         self._peer = peer
-        peer.addTrack(_tone_track())
+        # The app's microphone track; silence for now (the user's microphone
+        # comes with the two-way audio step).
+        peer.addTrack(AudioStreamTrack())
 
         @peer.on("track")
         def _on_track(track: Any) -> None:
@@ -389,7 +298,6 @@ class EosCallAnswerer:
         answer = await peer.createAnswer()
         await peer.setLocalDescription(answer)  # gathers our candidates
         answer_sdp, candidates = split_candidates(peer.localDescription.sdp)
-        answer_sdp = mirror_opus_fmtp(answer_sdp, device_sdp)
 
         # Each send goes to the client's current session, which a live view
         # could have moved: point it back at this call every time. (Older
@@ -474,6 +382,24 @@ class EosCallAnswerer:
             correlation_id=str(self.call.get("correlation_id") or ""),
             device_id=self.call.get("device_id") or "",
         )
+
+    async def _send_player(self, value: str) -> None:
+        """Send the app's rtc "player" message (``unmute`` takes the call).
+
+        pybticino has no sender for it, so the message is built here as the app
+        builds it (traced from com.netatmo.camera 4.1.1.3).
+        """
+        message = {
+            "action": "rtc",
+            "data": {"type": "player", "value": value},
+            "session_id": self.session_id,
+            "tag_id": self.call.get("tag_id") or "",
+            "device_id": self.call.get("device_id") or "",
+            # The server wants a positive long in a string (^\d+$).
+            "correlation_id": str(secrets.randbits(62) + 1),
+        }
+        await self._signaling._send(message)
+        _LOGGER.debug("Call %s: player %s sent", self.session_id, value)
 
     def _take_signaling(self) -> None:
         """Route the signaling client's callbacks here; live views set their own again."""

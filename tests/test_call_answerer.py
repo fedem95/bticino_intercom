@@ -18,7 +18,6 @@ from custom_components.bticino_intercom.call_answerer import (
     async_answer_call,
     async_hangup_call,
     current_answerer,
-    mirror_opus_fmtp,
     split_candidates,
     stun_servers,
 )
@@ -41,13 +40,6 @@ def loopback_ice(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(aioice.ice, "get_host_addresses", lambda use_ipv4, use_ipv6: ["127.0.0.1"])
 
 
-DEVICE_OPUS = (
-    "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
-    "a=rtpmap:111 OPUS/48000/2\r\n"
-    "a=fmtp:111 sprop-maxcapturerate=16000;sprop-stereo=1\r\n"
-)
-
-
 def test_stun_servers_keeps_stun_only() -> None:
     """TURN URLs and credentials are dropped; servers with no STUN URL vanish."""
     servers = stun_servers(
@@ -59,24 +51,6 @@ def test_stun_servers_keeps_stun_only() -> None:
     )
     assert [s.urls for s in servers] == [["stun:turn.netatmo.net:3478"], ["stun:stun.example:19302"]]
     assert all(s.username is None and s.credential is None for s in servers)
-
-
-def test_mirror_opus_fmtp_adds_stereo_and_device_params() -> None:
-    answer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10\r\n"
-    mirrored = mirror_opus_fmtp(answer, DEVICE_OPUS)
-    assert "a=fmtp:111 minptime=10;stereo=1;sprop-stereo=1;sprop-maxcapturerate=16000\r\n" in mirrored
-    assert mirrored.endswith("\r\n")
-
-
-def test_mirror_opus_fmtp_adds_missing_fmtp_line() -> None:
-    answer = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n"
-    mirrored = mirror_opus_fmtp(answer, DEVICE_OPUS)
-    assert "a=rtpmap:111 opus/48000/2\r\na=fmtp:111 stereo=1;sprop-stereo=1;sprop-maxcapturerate=16000" in mirrored
-
-
-def test_mirror_opus_fmtp_without_opus_is_untouched() -> None:
-    answer = "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n"
-    assert mirror_opus_fmtp(answer, "m=audio 9 UDP/TLS/RTP/SAVPF 0\r\na=rtpmap:0 PCMU/8000\r\n") == answer
 
 
 def test_split_candidates_by_m_line() -> None:
@@ -106,6 +80,7 @@ class FakeDevice:
         self.readers: list[asyncio.Future[None]] = []
         self.terminated: list[str] = []
         self.answers: list[str] = []
+        self.raw: list[dict[str, Any]] = []
         self._on_answer = None
         self._on_candidate = None
         self._on_event = None
@@ -162,6 +137,12 @@ class FakeDevice:
         self.terminated.append(self.session_id)
         self.session_id = None
 
+    async def _send(self, message: dict[str, Any]) -> None:
+        """Raw rtc messages: the answerer sends the app's "player" message this way."""
+        # Only once the media is up, as the app sends it on the green handset.
+        assert self.pc.connectionState == "connected"
+        self.raw.append(message)
+
     async def disconnect(self) -> None:
         pass
 
@@ -202,8 +183,19 @@ async def test_answer_connects_media_and_hangs_up(hass: HomeAssistant, account: 
     assert answerer.state == "connected"
     assert answerer.active
     assert device.pc.connectionState == "connected"
-    # Our answer carries no candidates (they are trickled) and mirrors stereo OPUS.
+    # Our answer carries no candidates (they are trickled), and no forced stereo
+    # OPUS: the app's answer has none.
     assert "a=candidate" not in device.answers[0]
+    assert "stereo=1" not in device.answers[0]
+    # The green handset: one "player unmute" on the call's session, as the app sends it.
+    assert len(device.raw) == 1
+    unmute = device.raw[0]
+    assert unmute["action"] == "rtc"
+    assert unmute["data"] == {"type": "player", "value": "unmute"}
+    assert unmute["session_id"] == SESSION_ID
+    assert unmute["tag_id"] == "tag-1"
+    assert unmute["device_id"] == BRIDGE_MAC
+    assert unmute["correlation_id"].isdigit()
 
     for _ in range(50):
         if device.audio_frames >= 5:
