@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .call_answerer import async_answer_call, async_hangup_call
+from .call_answerer import answering_supported, async_answer_call, async_hangup_call
 from .const import DOMAIN
 from .coordinator import BticinoIntercomCoordinator
 
@@ -20,7 +20,7 @@ async def async_setup_entry(
 ) -> None:
     """Add the answer and hang-up buttons to the bridge."""
     coordinator: BticinoIntercomCoordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    if not coordinator.main_device_id:
+    if not answering_supported(coordinator):
         return
     async_add_entities([BticinoAnswerCallButton(coordinator), BticinoHangupCallButton(coordinator)])
 

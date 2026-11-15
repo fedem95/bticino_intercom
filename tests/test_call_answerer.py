@@ -168,9 +168,43 @@ def _call(sdp: str | None) -> dict[str, Any]:
     }
 
 
-def _coordinator(call: dict[str, Any] | None) -> SimpleNamespace:
-    """The coordinator surface the answerer uses: the ringing call, and ending it."""
-    return SimpleNamespace(active_call=call, async_call_ended_here=MagicMock())
+def _coordinator(call: dict[str, Any] | None, bridge_type: str = "BNCX") -> SimpleNamespace:
+    """The coordinator surface the answerer uses: the bridge, the ringing call, and ending it."""
+    return SimpleNamespace(
+        main_device_id=BRIDGE_MAC,
+        data={"modules": {BRIDGE_MAC: {"id": BRIDGE_MAC, "type": bridge_type}}},
+        active_call=call,
+        async_call_ended_here=MagicMock(),
+    )
+
+
+async def test_player_message_uses_pybticino_when_it_has_it() -> None:
+    """With a pybticino that sends the player message, the call's session is selected and it is used."""
+    signaling = SimpleNamespace(_send=AsyncMock(), send_player=AsyncMock(), set_session_from_push=MagicMock())
+    await call_answerer.async_send_player(signaling, _call("v=0\r\n"), "unmute")
+    signaling.set_session_from_push.assert_called_once()
+    assert signaling.set_session_from_push.call_args.kwargs["session_id"] == SESSION_ID
+    signaling.send_player.assert_awaited_once_with("unmute")
+    signaling._send.assert_not_awaited()
+
+
+async def test_other_bridges_are_left_as_they_were(hass: HomeAssistant, account: SimpleNamespace) -> None:
+    """Only a Classe 300 EOS is answered here: other bridges get no unmute and no answer of ours."""
+    signaling = SimpleNamespace(_send=AsyncMock(), send_answer=AsyncMock())
+    call = _call("v=0\r\n")
+    coordinator = _coordinator(call, bridge_type="BNC1")
+    hass.data[DOMAIN] = {"entry1": {"coordinator": coordinator, "account": account, "signaling_client": signaling}}
+
+    assert not call_answerer.answering_supported(coordinator)
+    call_answerer.async_prepare_call(hass, "entry1")
+    assert ANSWERER_KEY not in hass.data[DOMAIN]["entry1"]
+    call_answerer.async_bridge_started(hass, "entry1", call)
+    assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
+    await async_answer_call(hass, "entry1", from_view=True)  # the card: silently nothing
+    with pytest.raises(HomeAssistantError, match="Classe 300 EOS only"):
+        await async_answer_call(hass, "entry1")
+    signaling._send.assert_not_awaited()
+    signaling.send_answer.assert_not_awaited()
 
 
 @pytest.fixture

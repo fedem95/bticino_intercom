@@ -36,7 +36,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
-from .const import DOMAIN
+from .const import ANSWER_BRIDGE_TYPES, DOMAIN
 
 if TYPE_CHECKING:
     from pybticino import AsyncAccount, SignalingClient
@@ -157,6 +157,16 @@ async def async_send_player(signaling: SignalingClient, call: dict[str, Any], va
     pybticino has no sender for it, so the message is built here as the app
     builds it (traced from com.netatmo.camera 4.1.1.3).
     """
+    send_player = getattr(signaling, "send_player", None)
+    if send_player is not None:  # pybticino with the player message
+        signaling.set_session_from_push(
+            session_id=str(call["session_id"]),
+            tag_id=call.get("tag_id") or "",
+            correlation_id=str(call.get("correlation_id") or ""),
+            device_id=call.get("device_id") or "",
+        )
+        await send_player(value)
+        return
     message = {
         "action": "rtc",
         "data": {"type": "player", "value": value},
@@ -177,7 +187,8 @@ def async_bridge_started(hass: HomeAssistant, entry_id: str, call: dict[str, Any
     The answer prepared for this ring is dropped: the device has its answer.
     """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
-    if entry_data is None:
+    if entry_data is None or not answering_supported(entry_data["coordinator"]):
+        # Other bridges: the view's answer stays as it always was, no unmute.
         return
     entry_data[BRIDGED_KEY] = {"call": dict(call), "unmuted": False}
     prepared = entry_data.get(ANSWERER_KEY)
@@ -195,6 +206,13 @@ def async_bridge_ended(hass: HomeAssistant, entry_id: str, session_id: str | Non
         if bridged["unmuted"]:
             # The view hangs up the call it took (the camera terminates it).
             entry_data["coordinator"].async_call_ended_here(str(session_id))
+
+
+def answering_supported(coordinator: Any) -> bool:
+    """Return whether this bridge's calls may be answered from Home Assistant (ANSWER_BRIDGE_TYPES)."""
+    bridge_id = getattr(coordinator, "main_device_id", None)
+    modules = (getattr(coordinator, "data", None) or {}).get("modules", {})
+    return bool(bridge_id) and modules.get(bridge_id, {}).get("type") in ANSWER_BRIDGE_TYPES
 
 
 def current_answerer(hass: HomeAssistant, entry_id: str) -> EosCallAnswerer | None:
@@ -231,6 +249,8 @@ async def async_answer_call(
             return
     if entry_data is None:
         raise HomeAssistantError("BTicino intercom not loaded")
+    if not answering_supported(entry_data["coordinator"]):
+        raise HomeAssistantError("Answering calls from Home Assistant is supported on the Classe 300 EOS only")
     if current_answerer(hass, entry_id):
         raise HomeAssistantError("A call is already answered from Home Assistant")
     call = entry_data["coordinator"].active_call
@@ -311,7 +331,7 @@ def async_prepare_call(hass: HomeAssistant, entry_id: str) -> None:
     PREPARED_TTL seconds, or when the next call comes in.
     """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
-    if entry_data is None:
+    if entry_data is None or not answering_supported(entry_data["coordinator"]):
         return
     call = entry_data["coordinator"].active_call
     if not call or not call.get("session_id") or not call.get("sdp"):
