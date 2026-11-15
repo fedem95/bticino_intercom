@@ -135,24 +135,32 @@ class FakeDevice:
         return self.pc.localDescription.sdp
 
     # --- the SignalingClient surface the answerer uses ---
+    # Single-session, as the pybticino build with FCM: every send goes to the
+    # current session, which set_session_from_push selects.
+
+    session_id: str | None = None
 
     def set_session_from_push(self, session_id: str, tag_id: str, correlation_id: str, device_id: str) -> None:
         self.sessions[session_id] = (tag_id, device_id)
+        self.session_id = session_id
 
-    async def send_answer(self, sdp: str, session_id: str | None = None) -> None:
+    async def send_answer(self, sdp: str) -> None:
+        assert self.session_id == SESSION_ID
         self.answers.append(sdp)
         await self.pc.setRemoteDescription(aiortc.RTCSessionDescription(sdp=sdp, type="answer"))
 
-    async def send_candidate(self, candidate: str, sdp_m_line_index: int, session_id: str | None = None) -> None:
+    async def send_candidate(self, candidate: str, sdp_m_line_index: int) -> None:
         from aiortc.sdp import candidate_from_sdp
 
+        assert self.session_id == SESSION_ID
         parsed = candidate_from_sdp(candidate.removeprefix("candidate:"))
         parsed.sdpMLineIndex = sdp_m_line_index
         parsed.sdpMid = self.pc.getTransceivers()[sdp_m_line_index].mid
         await self.pc.addIceCandidate(parsed)
 
-    async def send_terminate(self, session_id: str | None = None) -> None:
-        self.terminated.append(session_id)
+    async def send_terminate(self) -> None:
+        self.terminated.append(self.session_id)
+        self.session_id = None
 
     async def disconnect(self) -> None:
         pass

@@ -391,14 +391,18 @@ class EosCallAnswerer:
         answer_sdp, candidates = split_candidates(peer.localDescription.sdp)
         answer_sdp = mirror_opus_fmtp(answer_sdp, device_sdp)
 
+        # Each send goes to the client's current session, which a live view
+        # could have moved: point it back at this call every time. (Older
+        # pybticino builds take no session argument.)
         self._register_session()
-        await self._signaling.send_answer(answer_sdp, session_id=self.session_id)
+        await self._signaling.send_answer(answer_sdp)
         # The server refuses candidates that reach it before it has processed
-        # the answer ("Received ICE candidate before answer"); send_answer does
-        # not wait for the server's ack, so leave it a moment.
+        # the answer ("Received ICE candidate before answer"); not every
+        # pybticino waits for the server's ack, so leave it a moment.
         await asyncio.sleep(ANSWER_SETTLE)
         for m_line, candidate in candidates:
-            await self._signaling.send_candidate(candidate, m_line, session_id=self.session_id)
+            self._register_session()
+            await self._signaling.send_candidate(candidate, m_line)
         _LOGGER.debug(
             "Call %s: answer sent with %d local candidates (%d STUN servers)",
             self.session_id,
@@ -443,7 +447,7 @@ class EosCallAnswerer:
         if terminate and not self._remote_ended:
             self._register_session()
             try:
-                await self._signaling.send_terminate(session_id=self.session_id)
+                await self._signaling.send_terminate()
             except Exception as err:
                 _LOGGER.debug("Call %s: terminate not sent: %s", self.session_id, err)
         for sink in self._sinks:
