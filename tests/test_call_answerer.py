@@ -407,6 +407,31 @@ async def test_answer_on_open_view_only_unmutes(hass: HomeAssistant, account: Si
     assert call_answerer.BRIDGED_KEY not in hass.data[DOMAIN]["entry1"]
 
 
+async def test_answer_from_view_only_takes_a_ring_the_view_answered(
+    hass: HomeAssistant, account: SimpleNamespace
+) -> None:
+    """The card asks after every view: an ordinary live view must not answer anything."""
+    signaling = SimpleNamespace(_send=AsyncMock(), send_answer=AsyncMock())
+    call = _call("v=0\r\n")
+    coordinator = SimpleNamespace(active_call=None)
+    hass.data[DOMAIN] = {"entry1": {"coordinator": coordinator, "account": account, "signaling_client": signaling}}
+
+    # No ring at all: nothing, and no error for the card.
+    await async_answer_call(hass, "entry1", from_view=True)
+    # A ring, but no view answered it: still nothing (no aiortc answer of our own).
+    coordinator.active_call = call
+    await async_answer_call(hass, "entry1", from_view=True)
+    signaling._send.assert_not_awaited()
+    assert ANSWERER_KEY not in hass.data[DOMAIN]["entry1"]
+
+    # The view answered it: the unmute goes out, once.
+    call_answerer.async_bridge_started(hass, "entry1", call)
+    await async_answer_call(hass, "entry1", from_view=True)
+    await async_answer_call(hass, "entry1", from_view=True)
+    assert signaling._send.await_count == 1
+    assert signaling._send.await_args.args[0]["data"] == {"type": "player", "value": "unmute"}
+
+
 async def test_closed_view_is_forgotten(hass: HomeAssistant, account: SimpleNamespace) -> None:
     """Once the view closes, its session is no longer answered by unmute."""
     signaling = SimpleNamespace(_send=AsyncMock())

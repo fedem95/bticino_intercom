@@ -21,6 +21,15 @@ answer_call:
           min: 10
           max: 600
           unit_of_measurement: s
+    from_view:
+      name: From a view
+      description: >-
+        Called by a card whose stream just connected: take the ring only if
+        that view answered it (the app's green handset), otherwise do nothing.
+      required: false
+      default: false
+      selector:
+        boolean:
 hangup_call:
   name: Hang Up Call
   description: Hang up the call answered from Home Assistant.

@@ -187,9 +187,32 @@ def current_answerer(hass: HomeAssistant, entry_id: str) -> EosCallAnswerer | No
     return answerer if answerer is not None and answerer.active else None
 
 
-async def async_answer_call(hass: HomeAssistant, entry_id: str, max_duration: float = DEFAULT_MAX_DURATION) -> None:
-    """Answer the entry's ringing call from Home Assistant. Raises HomeAssistantError."""
+async def async_answer_call(
+    hass: HomeAssistant,
+    entry_id: str,
+    max_duration: float = DEFAULT_MAX_DURATION,
+    *,
+    from_view: bool = False,
+) -> None:
+    """Answer the entry's ringing call from Home Assistant. Raises HomeAssistantError.
+
+    With ``from_view`` (a card whose stream just connected) only a ring that a
+    view has answered is taken, with the unmute; anything else is left alone
+    and nothing is raised: the card calls it after every connection, and most
+    are ordinary live views.
+    """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
+    if from_view:
+        bridged = (entry_data or {}).get(BRIDGED_KEY)
+        call = entry_data["coordinator"].active_call if entry_data else None
+        if (
+            bridged is None
+            or bridged["unmuted"]
+            or not call
+            or str(bridged["call"]["session_id"]) != str(call.get("session_id"))
+        ):
+            _LOGGER.debug("answer_call from a view: no ring answered by a view to take")
+            return
     if entry_data is None:
         raise HomeAssistantError("BTicino intercom not loaded")
     if current_answerer(hass, entry_id):

@@ -303,7 +303,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _async_answer_call(call: ServiceCall) -> None:
         max_duration = float(call.data.get("max_duration", DEFAULT_MAX_DURATION))
-        await async_answer_call(hass, _service_entry_id(call), max_duration=max_duration)
+        await async_answer_call(
+            hass,
+            _service_entry_id(call),
+            max_duration=max_duration,
+            from_view=bool(call.data.get("from_view", False)),
+        )
 
     async def _async_hangup_call(call: ServiceCall) -> None:
         await async_hangup_call(hass, _service_entry_id(call))
