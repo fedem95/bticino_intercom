@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import warnings
 from collections.abc import Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -63,6 +64,18 @@ _dtls_patched = False
 
 class CallAnswerError(Exception):
     """The call could not be answered."""
+
+
+def _import_aiortc_quietly() -> None:
+    """Import aiortc without google-crc32c's warning about its pure Python build.
+
+    aiortc needs crc32c only for SCTP data channels, which these calls never
+    open; on Home Assistant OS the package comes without its C extension and
+    warns once, on the first import, that it is slower.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*google-crc32c.*", category=RuntimeWarning)
+        import aiortc  # noqa: F401
 
 
 def _patch_dtls_ciphers() -> None:
@@ -486,6 +499,7 @@ class EosCallAnswerer:
 
     async def _async_build_peer(self, device_sdp: str) -> None:
         """Peer connection on the device offer, with our candidates gathered."""
+        _import_aiortc_quietly()
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
         from aiortc.mediastreams import AudioStreamTrack
 
