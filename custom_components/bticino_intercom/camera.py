@@ -1190,7 +1190,7 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                     send_message(WebRTCAnswer(answer=browser_answer))
                     # This is the app's preview: the indoor monitor keeps ringing
                     # until answer_call sends the green handset's unmute.
-                    async_bridge_started(self.hass, self.coordinator.entry.entry_id, answer_call)
+                    async_bridge_started(self.hass, self.coordinator.entry.entry_id, answer_call, session_id)
                 else:
                     answer_sdp = self.convert_offer_to_answer_sdp(offer_sdp)
                     await self._signaling.send_answer(answer_sdp, session_id=call_session)

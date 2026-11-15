@@ -231,16 +231,20 @@ async def async_send_player(signaling: SignalingClient, call: dict[str, Any], va
 
 
 @callback
-def async_bridge_started(hass: HomeAssistant, entry_id: str, call: dict[str, Any]) -> None:
+def async_bridge_started(
+    hass: HomeAssistant, entry_id: str, call: dict[str, Any], view_session_id: str | None = None
+) -> None:
     """A view answered the ringing call (the preview): answer_call will only unmute it.
 
-    The answer prepared for this ring is dropped: the device has its answer.
+    `view_session_id` is the view's Home Assistant WebRTC session, which the
+    card names when it reports the media up (webrtc_connected). The answer
+    prepared for this ring is dropped: the device has its answer.
     """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if entry_data is None or not answering_supported(entry_data["coordinator"]):
         # Other bridges: the view's answer stays as it always was, no unmute.
         return
-    entry_data[BRIDGED_KEY] = {"call": dict(call), "unmuted": False}
+    entry_data[BRIDGED_KEY] = {"call": dict(call), "unmuted": False, "view_session_id": view_session_id}
     prepared = entry_data.get(ANSWERER_KEY)
     if prepared is not None and not prepared.active:
         hass.async_create_task(prepared.async_discard(), "bticino_intercom discard prepared answer")
@@ -277,13 +281,15 @@ async def async_answer_call(
     max_duration: float = DEFAULT_MAX_DURATION,
     *,
     from_view: bool = False,
+    view_session_id: str | None = None,
 ) -> None:
     """Answer the entry's ringing call from Home Assistant. Raises HomeAssistantError.
 
     With ``from_view`` (a card whose stream just connected) only a ring that a
     view has answered is taken, with the unmute; anything else is left alone
-    and nothing is raised: the card calls it after every connection, and most
-    are ordinary live views.
+    and nothing is raised: the card reports every connection, and most are
+    ordinary live views. ``view_session_id`` names the view that connected:
+    the ring is taken only if that view answered it.
     """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if from_view:
@@ -294,6 +300,7 @@ async def async_answer_call(
             or bridged["unmuted"]
             or not call
             or str(bridged["call"]["session_id"]) != str(call.get("session_id"))
+            or (view_session_id is not None and bridged.get("view_session_id") not in (None, view_session_id))
         ):
             _LOGGER.debug("answer_call from a view: no ring answered by a view to take")
             return

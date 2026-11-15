@@ -15,7 +15,10 @@ from typing import TYPE_CHECKING, Any
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 
+from .call_answerer import async_answer_call
 from .const import DOMAIN
 from .history import IMAGE_KINDS, EventHistoryStore
 from .media_source import BticinoHistoryImageView
@@ -37,7 +40,41 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     if hass.data.get(WEBSOCKET_API_FLAG):
         return
     websocket_api.async_register_command(hass, ws_list_history)
+    websocket_api.async_register_command(hass, ws_webrtc_connected)
     hass.data[WEBSOCKET_API_FLAG] = True
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/webrtc_connected",
+        vol.Required("entity_id"): str,
+        vol.Required("session_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_webrtc_connected(
+    hass: HomeAssistant,
+    connection: ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """A card's WebRTC session has its media up: take the ring that view answered.
+
+    The card reports every connection; only the integration knows whether
+    that view answered a ring. On a Classe 300 EOS the view's answer is the
+    app's preview, and the call is taken with one player unmute, a toggle,
+    so it is sent once per ring. For any other view nothing happens.
+    """
+    entity = er.async_get(hass).async_get(msg["entity_id"])
+    entry_id = entity.config_entry_id if entity is not None and entity.platform == DOMAIN else None
+    if entry_id is None or entry_id not in hass.data.get(DOMAIN, {}):
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Not a BTicino intercom camera")
+        return
+    try:
+        await async_answer_call(hass, entry_id, from_view=True, view_session_id=msg["session_id"])
+    except HomeAssistantError as err:
+        connection.send_error(msg["id"], websocket_api.ERR_HOME_ASSISTANT_ERROR, str(err))
+        return
+    connection.send_result(msg["id"])
 
 
 @websocket_api.websocket_command(

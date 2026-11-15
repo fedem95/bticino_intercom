@@ -164,3 +164,55 @@ async def test_entry_without_a_store_is_skipped(hass, hass_ws_client, seeded_his
         "evt_missed",
         "evt_answered",
     ]
+
+
+# --- webrtc_connected: a card's view has its media up ---
+
+CONNECTED = f"{DOMAIN}/webrtc_connected"
+
+
+@pytest.fixture
+def intercom_camera(hass: HomeAssistant) -> str:
+    """A camera of a loaded BTicino entry, as the card names it."""
+    from homeassistant.helpers import entity_registry as er
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(domain=DOMAIN, entry_id="entry_cam")
+    entry.add_to_hass(hass)
+    hass.data.setdefault(DOMAIN, {})["entry_cam"] = {}
+    async_register_websocket_api(hass)
+    return er.async_get(hass).async_get_or_create("camera", DOMAIN, "cam_unique", config_entry=entry).entity_id
+
+
+async def test_connected_view_may_take_its_ring(hass, hass_ws_client, intercom_camera) -> None:
+    """The integration is asked to take a ring this very view answered, and nothing more."""
+    from unittest.mock import AsyncMock
+
+    with patch("custom_components.bticino_intercom.websocket_api.async_answer_call", AsyncMock()) as answer:
+        client = await hass_ws_client(hass)
+        await client.send_json({"id": 1, "type": CONNECTED, "entity_id": intercom_camera, "session_id": "view-1"})
+        message = await client.receive_json()
+    assert message["success"], message
+    answer.assert_awaited_once_with(hass, "entry_cam", from_view=True, view_session_id="view-1")
+
+
+async def test_connected_for_another_camera_is_not_found(hass, hass_ws_client, intercom_camera) -> None:
+    client = await hass_ws_client(hass)
+    await client.send_json({"id": 1, "type": CONNECTED, "entity_id": "camera.elsewhere", "session_id": "view-1"})
+    message = await client.receive_json()
+    assert not message["success"]
+    assert message["error"]["code"] == "not_found"
+
+
+async def test_connected_reports_a_failed_take(hass, hass_ws_client, intercom_camera) -> None:
+    from unittest.mock import AsyncMock
+
+    from homeassistant.exceptions import HomeAssistantError
+
+    failing = AsyncMock(side_effect=HomeAssistantError("Could not take the call: gone"))
+    with patch("custom_components.bticino_intercom.websocket_api.async_answer_call", failing):
+        client = await hass_ws_client(hass)
+        await client.send_json({"id": 1, "type": CONNECTED, "entity_id": intercom_camera, "session_id": "view-1"})
+        message = await client.receive_json()
+    assert not message["success"]
+    assert "gone" in message["error"]["message"]

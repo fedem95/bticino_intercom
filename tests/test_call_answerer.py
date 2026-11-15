@@ -505,10 +505,13 @@ async def test_answer_from_view_only_takes_a_ring_the_view_answered(
     signaling._send.assert_not_awaited()
     assert ANSWERER_KEY not in hass.data[DOMAIN]["entry1"]
 
-    # The view answered it: the unmute goes out, once.
-    call_answerer.async_bridge_started(hass, "entry1", call)
-    await async_answer_call(hass, "entry1", from_view=True)
-    await async_answer_call(hass, "entry1", from_view=True)
+    # The view answered it: another view connecting takes nothing; that one
+    # does, with the unmute, once (it toggles).
+    call_answerer.async_bridge_started(hass, "entry1", call, "view-1")
+    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-2")
+    signaling._send.assert_not_awaited()
+    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1")
+    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1")
     assert signaling._send.await_count == 1
     assert signaling._send.await_args.args[0]["data"] == {"type": "player", "value": "unmute"}
 

@@ -373,7 +373,9 @@ The integration always does both, in one of these ways:
 
 Services:
 
-- `bticino_intercom.answer_call` — answer the ringing call (`max_duration` in seconds, default 120). With `from_view: true` (what the card sends) it only takes a ring that a view has answered, and does nothing otherwise.
+- `bticino_intercom.answer_call` — answer the ringing call (`max_duration` in seconds, default 120). With `from_view: true` it only takes a ring that a view has answered, and does nothing otherwise.
+
+The card reports every connection whose media is up with the WebSocket command `bticino_intercom/webrtc_connected` (`entity_id`, `session_id`: the view's WebRTC session). If that view answered the ring, the integration sends the unmute, once per ring (it toggles); for any other view it does nothing.
 - `bticino_intercom.hangup_call` — hang up a call answered from Home Assistant or taken on a view.
 
 Notes:
