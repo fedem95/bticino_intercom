@@ -42,6 +42,7 @@ from .const import (
     TOKEN_STORAGE_VERSION,
 )
 from .coordinator import BticinoIntercomCoordinator
+from .fcm_push import async_start_fcm_listener, fcm_store
 from .history import EventHistoryStore, get_history_options
 from .media_source import BticinoHistoryImageView
 from .websocket_api import async_register_websocket_api
@@ -61,6 +62,7 @@ ACCOUNT_KEY = "account"
 COORDINATOR_KEY = "coordinator"
 START_LISTENER_REMOVE_KEY = "start_listener_remove"
 HISTORY_KEY = "history"
+FCM_LISTENER_KEY = "fcm_listener"
 HISTORY_VIEW_FLAG = f"{DOMAIN}_history_view_registered"
 
 
@@ -218,6 +220,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Add the update listener
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+
+    # A Classe 300 EOS sends its call offer through FCM only (see fcm_push.py).
+    # Started in the background: registration talks to Google and Netatmo.
+    async def _async_start_fcm() -> None:
+        listener = await async_start_fcm_listener(hass, entry, account, coordinator)
+        if listener is None:
+            return
+        if entry_data := hass.data.get(DOMAIN, {}).get(entry.entry_id):
+            entry_data[FCM_LISTENER_KEY] = listener
+        else:
+            await listener.async_stop()
+
+    entry.async_create_background_task(hass, _async_start_fcm(), f"{DOMAIN} FCM start - {entry.entry_id}")
 
     # Register debug service when integration logger is at DEBUG level.
     # Protected by HA authentication — requires a valid access token.
@@ -531,6 +546,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ws_task.cancel()
             with suppress(asyncio.CancelledError):
                 await ws_task
+        # Keep the push context: the same FCM identity is used again at the next start.
+        if fcm_listener := entry_data.pop(FCM_LISTENER_KEY, None):
+            await fcm_listener.async_stop(drop_context=False)
 
     entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_cancel_websocket_on_stop))
 
@@ -553,6 +571,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Clean up websocket client (disconnect is handled by task cancellation finally)
         entry_data.pop(WEBSOCKET_CLIENT_KEY, None)
+
+        # Stop FCM and remove its push context from the account
+        if fcm_listener := entry_data.pop(FCM_LISTENER_KEY, None):
+            await fcm_listener.async_stop()
 
         # Clean up signaling client
         signaling = entry_data.pop(SIGNALING_CLIENT_KEY, None)
@@ -601,6 +623,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Clean up stored tokens and history when an entry is permanently removed."""
     token_store = Store(hass, TOKEN_STORAGE_VERSION, f"{DOMAIN}.tokens.{entry.entry_id}")
     await token_store.async_remove()
+    await fcm_store(hass, entry.entry_id).async_remove()
     history_store = EventHistoryStore(hass, entry.entry_id)
     await history_store.async_load()
     await history_store.async_clear()
