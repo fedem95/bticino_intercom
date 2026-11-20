@@ -254,6 +254,38 @@ async def test_answering_marks_the_call_answered(
     mark_call_answered.assert_called_once_with(camera._module_id)
 
 
+async def test_eos_view_of_a_ring_is_a_preview(
+    hass: HomeAssistant,
+    mock_setup_entry: MockConfigEntry,
+) -> None:
+    """On a Classe 300 EOS answering the ring's offer is the app's preview: the call still rings."""
+    camera = _get_webrtc_camera(hass, mock_setup_entry)
+    camera.coordinator.data["modules"][camera.coordinator.main_device_id]["type"] = "BNCX"
+    camera.coordinator._active_call = {
+        "session_id": "sess_incoming",
+        "tag_id": "tag123",
+        "device_id": BRIDGE_MAC,
+        "module_id": camera._module_id,
+        "sdp": _DEVICE_OFFER_SDP,
+    }
+    signaling = hass.data[DOMAIN][mock_setup_entry.entry_id]["signaling_client"]
+    signaling.send_answer = AsyncMock()
+    signaling.send_offer = AsyncMock(return_value="sess_new")
+    signaling._is_connected = True
+    signaling.is_connected = True
+
+    with (
+        patch.object(camera.coordinator, "mark_call_answered") as mark_call_answered,
+        patch("custom_components.bticino_intercom.camera.async_bridge_started") as bridge_started,
+    ):
+        await camera.async_handle_async_webrtc_offer(_CARD_OFFER_SDP, "view-1", [].append)
+
+    signaling.send_answer.assert_awaited_once()
+    mark_call_answered.assert_not_called()
+    # The view is recorded with its session, for the user's explicit answer.
+    assert bridge_started.call_args.args[3] == "view-1"
+
+
 async def test_answer_mode_only_for_matching_module(
     hass: HomeAssistant,
     mock_setup_entry: MockConfigEntry,

@@ -176,6 +176,7 @@ def _coordinator(call: dict[str, Any] | None, bridge_type: str = "BNCX") -> Simp
         data={"modules": {BRIDGE_MAC: {"id": BRIDGE_MAC, "type": bridge_type}}},
         active_call=call,
         async_call_ended_here=MagicMock(),
+        mark_call_answered=MagicMock(),
     )
 
 
@@ -498,22 +499,25 @@ async def test_answer_from_view_only_takes_a_ring_the_view_answered(
     hass.data[DOMAIN] = {"entry1": {"coordinator": coordinator, "account": account, "signaling_client": signaling}}
 
     # No ring at all: nothing, and no error for the card.
-    await async_answer_call(hass, "entry1", from_view=True)
+    assert await async_answer_call(hass, "entry1", from_view=True) is False
     # A ring, but no view answered it: still nothing (no aiortc answer of our own).
     coordinator.active_call = call
-    await async_answer_call(hass, "entry1", from_view=True)
+    assert await async_answer_call(hass, "entry1", from_view=True) is False
     signaling._send.assert_not_awaited()
     assert ANSWERER_KEY not in hass.data[DOMAIN]["entry1"]
 
-    # The view answered it: another view connecting takes nothing; that one
-    # does, with the unmute, once (it toggles).
+    # The view answered it (the preview): another view takes nothing; the
+    # user's answer on that view does, with the unmute, once (it toggles).
     call_answerer.async_bridge_started(hass, "entry1", call, "view-1")
-    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-2")
+    assert await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-2") is False
     signaling._send.assert_not_awaited()
-    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1")
-    await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1")
+    coordinator.mark_call_answered.assert_not_called()
+    assert await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1") is True
+    assert await async_answer_call(hass, "entry1", from_view=True, view_session_id="view-1") is False
     assert signaling._send.await_count == 1
     assert signaling._send.await_args.args[0]["data"] == {"type": "player", "value": "unmute"}
+    # Taken: the ring stops for the cards at once.
+    coordinator.mark_call_answered.assert_called_once_with(call["module_id"])
 
 
 async def test_closed_view_is_forgotten(hass: HomeAssistant, account: SimpleNamespace) -> None:

@@ -367,7 +367,8 @@ The integration always does both, in one of these ways:
 
 | How you answer | What you get |
 |---|---|
-| **The card** ([bticino_ha_extras](https://github.com/k-the-hidden-hero/bticino_ha_extras)): open the external unit while it rings, or tap *answer* on its ring screen | Video and two-way audio on the phone, which connects straight to the intercom. The card starts the microphone and takes the call itself once connected. |
+| **The card** ([bticino_ha_extras](https://github.com/k-the-hidden-hero/bticino_ha_extras)): tap *answer* on its ring screen | Video and two-way audio on the phone, which connects straight to the intercom. The card starts the microphone and takes the call once connected. |
+| **Opening the external unit while it rings** (the card's call button, Home Assistant's own player) | A preview, as in the official app: you see who is at the door and the indoor monitor keeps ringing (the official app on other phones stops, as with the app's preview). *Answer* on the card's ring screen then takes the call. |
 | **A notification action** opening the card's view with `?answer=<camera entity>` in the URL (e.g. `/dashboard/intercom?answer=camera.front_door`) | The same, from the notification. |
 | **The "Answer call" button** or the `bticino_intercom.answer_call` service, with no view open | Home Assistant answers as the media peer itself (with [aiortc](https://github.com/aiortc/aiortc)): the call is taken and stops ringing everywhere, but nobody sees or hears it. Useful to stop the ring. Takes about 2 s: the answer is prepared while the call rings, and nothing is sent until you answer. |
 
@@ -375,7 +376,7 @@ Services:
 
 - `bticino_intercom.answer_call` — answer the ringing call (`max_duration` in seconds, default 120). With `from_view: true` it only takes a ring that a view has answered, and does nothing otherwise.
 
-The card reports every connection whose media is up with the WebSocket command `bticino_intercom/webrtc_connected` (`entity_id`, `session_id`: the view's WebRTC session). If that view answered the ring, the integration sends the unmute, once per ring (it toggles); for any other view it does nothing.
+The card takes the call with the WebSocket command `bticino_intercom/call/unmute` (`entity_id`, `session_id`: the view's WebRTC session), sent only on an explicit answer, once that view's media is up. If that view answered the ring, the integration sends the unmute, once per ring (it toggles), and answers `{"answered": true}`; for any other view it does nothing. `bticino_intercom/webrtc_connected`, which the card sends on every connection, takes nothing: a view is a preview until the user answers.
 - `bticino_intercom.hangup_call` — hang up a call answered from Home Assistant or taken on a view.
 
 Notes:

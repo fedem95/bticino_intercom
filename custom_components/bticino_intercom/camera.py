@@ -1186,10 +1186,12 @@ class BticinoWebRTCCamera(CoordinatorEntity[BticinoIntercomCoordinator], Camera)
                             _LOGGER.debug("Answer mode %s:\n%s", label, _sdp_digest(sdp))
                     await self._signaling.send_answer(device_answer, session_id=call_session)
                     self._answered_call_session = call_session
-                    self.coordinator.mark_call_answered(self._module_id)
                     send_message(WebRTCAnswer(answer=browser_answer))
-                    # This is the app's preview: the indoor monitor keeps ringing
-                    # until answer_call sends the green handset's unmute.
+                    # This is the app's preview: who is at the door, while the
+                    # indoor monitor keeps ringing. The call is not taken, so it
+                    # is not marked answered: it still rings for the cards. Only
+                    # an explicit answer sends the green handset's unmute
+                    # (bticino_intercom/call/unmute).
                     async_bridge_started(self.hass, self.coordinator.entry.entry_id, answer_call, session_id)
                 else:
                     answer_sdp = self.convert_offer_to_answer_sdp(offer_sdp)

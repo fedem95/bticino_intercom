@@ -184,8 +184,11 @@ def intercom_camera(hass: HomeAssistant) -> str:
     return er.async_get(hass).async_get_or_create("camera", DOMAIN, "cam_unique", config_entry=entry).entity_id
 
 
-async def test_connected_view_may_take_its_ring(hass, hass_ws_client, intercom_camera) -> None:
-    """The integration is asked to take a ring this very view answered, and nothing more."""
+UNMUTE = f"{DOMAIN}/call/unmute"
+
+
+async def test_connected_takes_nothing(hass, hass_ws_client, intercom_camera) -> None:
+    """Opening the camera during a ring is a preview: a connected view never takes the call."""
     from unittest.mock import AsyncMock
 
     with patch("custom_components.bticino_intercom.websocket_api.async_answer_call", AsyncMock()) as answer:
@@ -193,18 +196,33 @@ async def test_connected_view_may_take_its_ring(hass, hass_ws_client, intercom_c
         await client.send_json({"id": 1, "type": CONNECTED, "entity_id": intercom_camera, "session_id": "view-1"})
         message = await client.receive_json()
     assert message["success"], message
-    answer.assert_awaited_once_with(hass, "entry_cam", from_view=True, view_session_id="view-1")
+    answer.assert_not_awaited()
 
 
-async def test_connected_for_another_camera_is_not_found(hass, hass_ws_client, intercom_camera) -> None:
+async def test_explicit_answer_takes_the_ring_of_that_view(hass, hass_ws_client, intercom_camera) -> None:
+    """The user's answer takes the ring this very view answered, and says whether it did."""
+    from unittest.mock import AsyncMock
+
+    taken = AsyncMock(return_value=True)
+    with patch("custom_components.bticino_intercom.websocket_api.async_answer_call", taken):
+        client = await hass_ws_client(hass)
+        await client.send_json({"id": 1, "type": UNMUTE, "entity_id": intercom_camera, "session_id": "view-1"})
+        message = await client.receive_json()
+    assert message["success"], message
+    assert message["result"] == {"answered": True}
+    taken.assert_awaited_once_with(hass, "entry_cam", from_view=True, view_session_id="view-1")
+
+
+@pytest.mark.parametrize("command", [CONNECTED, UNMUTE])
+async def test_another_camera_is_not_found(hass, hass_ws_client, intercom_camera, command) -> None:
     client = await hass_ws_client(hass)
-    await client.send_json({"id": 1, "type": CONNECTED, "entity_id": "camera.elsewhere", "session_id": "view-1"})
+    await client.send_json({"id": 1, "type": command, "entity_id": "camera.elsewhere", "session_id": "view-1"})
     message = await client.receive_json()
     assert not message["success"]
     assert message["error"]["code"] == "not_found"
 
 
-async def test_connected_reports_a_failed_take(hass, hass_ws_client, intercom_camera) -> None:
+async def test_explicit_answer_reports_a_failed_take(hass, hass_ws_client, intercom_camera) -> None:
     from unittest.mock import AsyncMock
 
     from homeassistant.exceptions import HomeAssistantError
@@ -212,7 +230,7 @@ async def test_connected_reports_a_failed_take(hass, hass_ws_client, intercom_ca
     failing = AsyncMock(side_effect=HomeAssistantError("Could not take the call: gone"))
     with patch("custom_components.bticino_intercom.websocket_api.async_answer_call", failing):
         client = await hass_ws_client(hass)
-        await client.send_json({"id": 1, "type": CONNECTED, "entity_id": intercom_camera, "session_id": "view-1"})
+        await client.send_json({"id": 1, "type": UNMUTE, "entity_id": intercom_camera, "session_id": "view-1"})
         message = await client.receive_json()
     assert not message["success"]
     assert "gone" in message["error"]["message"]

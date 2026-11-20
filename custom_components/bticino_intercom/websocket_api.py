@@ -41,7 +41,15 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         return
     websocket_api.async_register_command(hass, ws_list_history)
     websocket_api.async_register_command(hass, ws_webrtc_connected)
+    websocket_api.async_register_command(hass, ws_call_unmute)
     hass.data[WEBSOCKET_API_FLAG] = True
+
+
+def _camera_entry_id(hass: HomeAssistant, entity_id: str) -> str | None:
+    """The config entry of a BTicino camera, if it is loaded."""
+    entity = er.async_get(hass).async_get(entity_id)
+    entry_id = entity.config_entry_id if entity is not None and entity.platform == DOMAIN else None
+    return entry_id if entry_id in hass.data.get(DOMAIN, {}) else None
 
 
 @websocket_api.websocket_command(
@@ -51,30 +59,57 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
         vol.Required("session_id"): str,
     }
 )
-@websocket_api.async_response
-async def ws_webrtc_connected(
+@callback
+def ws_webrtc_connected(
     hass: HomeAssistant,
     connection: ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """A card's WebRTC session has its media up: take the ring that view answered.
+    """A card's WebRTC session has its media up. Nothing is taken on it.
 
-    The card reports every connection; only the integration knows whether
-    that view answered a ring. On a Classe 300 EOS the view's answer is the
-    app's preview, and the call is taken with one player unmute, a toggle,
-    so it is sent once per ring. For any other view nothing happens.
+    Opening the camera during a ring is a preview: the stream shows who is
+    at the door and the call keeps ringing. Taking the call needs an
+    explicit answer from the user (bticino_intercom/call/unmute). The
+    command is acknowledged so cards that report it get no error.
     """
-    entity = er.async_get(hass).async_get(msg["entity_id"])
-    entry_id = entity.config_entry_id if entity is not None and entity.platform == DOMAIN else None
-    if entry_id is None or entry_id not in hass.data.get(DOMAIN, {}):
+    if _camera_entry_id(hass, msg["entity_id"]) is None:
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Not a BTicino intercom camera")
+        return
+    connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/call/unmute",
+        vol.Required("entity_id"): str,
+        vol.Required("session_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_call_unmute(
+    hass: HomeAssistant,
+    connection: ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """The user answered on a card: take the ring that card's view is showing.
+
+    On a Classe 300 EOS the view's answer to the ring is the app's preview;
+    the call is taken with one player unmute (the green handset), a toggle,
+    so it is sent once per ring and only for the view that answered it
+    (``session_id`` is the view's WebRTC session). The result says whether
+    the call was taken: an ordinary live view, or a ring already over, has
+    nothing to take.
+    """
+    entry_id = _camera_entry_id(hass, msg["entity_id"])
+    if entry_id is None:
         connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, "Not a BTicino intercom camera")
         return
     try:
-        await async_answer_call(hass, entry_id, from_view=True, view_session_id=msg["session_id"])
+        answered = await async_answer_call(hass, entry_id, from_view=True, view_session_id=msg["session_id"])
     except HomeAssistantError as err:
         connection.send_error(msg["id"], websocket_api.ERR_HOME_ASSISTANT_ERROR, str(err))
         return
-    connection.send_result(msg["id"])
+    connection.send_result(msg["id"], {"answered": answered})
 
 
 @websocket_api.websocket_command(

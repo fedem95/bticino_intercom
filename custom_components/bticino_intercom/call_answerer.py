@@ -282,14 +282,15 @@ async def async_answer_call(
     *,
     from_view: bool = False,
     view_session_id: str | None = None,
-) -> None:
+) -> bool:
     """Answer the entry's ringing call from Home Assistant. Raises HomeAssistantError.
 
-    With ``from_view`` (a card whose stream just connected) only a ring that a
-    view has answered is taken, with the unmute; anything else is left alone
-    and nothing is raised: the card reports every connection, and most are
-    ordinary live views. ``view_session_id`` names the view that connected:
-    the ring is taken only if that view answered it.
+    With ``from_view`` (the user answered on a card whose view shows the
+    ring) only a ring that a view has answered is taken, with the unmute;
+    anything else is left alone and nothing is raised. ``view_session_id``
+    names the view: the ring is taken only if that view answered it.
+
+    Returns True once the call is taken.
     """
     entry_data = hass.data.get(DOMAIN, {}).get(entry_id)
     if from_view:
@@ -303,7 +304,7 @@ async def async_answer_call(
             or (view_session_id is not None and bridged.get("view_session_id") not in (None, view_session_id))
         ):
             _LOGGER.debug("answer_call from a view: no ring answered by a view to take")
-            return
+            return False
     if entry_data is None:
         raise HomeAssistantError("BTicino intercom not loaded")
     if not answering_supported(entry_data["coordinator"]):
@@ -329,8 +330,11 @@ async def async_answer_call(
         except Exception as err:
             raise HomeAssistantError(f"Could not take the call: {err}") from err
         bridged["unmuted"] = True
+        if call.get("module_id"):
+            # Taken: the ring stops for the cards now, before accepted_call.
+            entry_data["coordinator"].mark_call_answered(call["module_id"])
         _LOGGER.info("Call %s answered on the open view (player unmute)", call["session_id"])
-        return
+        return True
 
     answerer = entry_data.get(ANSWERER_KEY)
     if answerer is None or answerer.session_id != str(call["session_id"]) or answerer.state != "idle":
@@ -346,6 +350,7 @@ async def async_answer_call(
         await answerer.async_answer()
     except CallAnswerError as err:
         raise HomeAssistantError(str(err)) from err
+    return True
 
 
 async def async_hangup_call(hass: HomeAssistant, entry_id: str) -> None:
